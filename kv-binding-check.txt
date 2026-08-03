@@ -1,0 +1,4 @@
+Binding name: CASES
+Namespace: hero-insure-cases
+Namespace ID: 84090974ff9046c2a1c81545b2550a64
+Configured: 2026-08-03
