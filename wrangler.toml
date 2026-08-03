@@ -1,0 +1,8 @@
+name = "hero-insure-line"
+main = "worker.js"
+compatibility_date = "2026-08-03"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "CASES"
+id = "84090974ff9046c2a1c81545b2550a64"
