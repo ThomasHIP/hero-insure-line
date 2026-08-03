@@ -1,0 +1,13 @@
+{
+  "name": "hero-insure-line",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HERO Insure LINE Official Account webhook on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
