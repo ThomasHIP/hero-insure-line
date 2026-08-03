@@ -1,3 +1,5 @@
+Connected to Cloudflare
+
 # HERO Insure LINE Bot
 
 Cloudflare Worker for the HERO Insure LINE Official Account.
