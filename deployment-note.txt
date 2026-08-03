@@ -1,0 +1,1 @@
+KV binding configured through wrangler.toml: CASES -> hero-insure-cases (84090974ff9046c2a1c81545b2550a64).
