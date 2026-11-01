@@ -10,7 +10,7 @@ class KV {
 }
 class R2 {
   values = new Map(); fail = false;
-  async put(key, value, options={}) { if(this.fail) throw Error('R2 unavailable'); const bytes = new Uint8Array(await new Response(value).arrayBuffer()); this.values.set(key,{bytes,options}); return {size:bytes.length,key}; }
+  async put(key, value, options={}) { if(key.includes('/files/') && !key.endsWith('.json')) assert.ok(value instanceof ArrayBuffer,'R2 original upload must have a known byte length'); if(this.fail) throw Error('R2 unavailable'); const bytes = new Uint8Array(await new Response(value).arrayBuffer()); this.values.set(key,{bytes,options}); return {size:bytes.length,key}; }
   async get(key) { const value=this.values.get(key); if(!value)return null; return {key,size:value.bytes.length,httpMetadata:value.options.httpMetadata,body:new Response(value.bytes).body,json:async()=>JSON.parse(new TextDecoder().decode(value.bytes)),arrayBuffer:async()=>value.bytes.slice().buffer}; }
   async head(key) { const value=this.values.get(key);return value?{size:value.bytes.length}:null; }
   async list({prefix}) { return {objects:[...this.values.keys()].filter(k=>k.startsWith(prefix)).map(key=>({key})),truncated:false}; }
