@@ -90,3 +90,15 @@ assert.equal(rejected.line.reason,'LINE_TOKEN_SECRET_REJECTED');
 assert.ok(!JSON.stringify(rejected).includes('invalid-test-secret'));
 globalThis.fetch = originalFetch;
 console.log('PASS: token renewal; rejected-secret privacy; signatures; image download; verified storage; fast uploads under KV throttling; duplicate delivery; consent; Thai OCR fields; private file access; admin correction; XSS escaping; failed-download reporting; failed-storage retry status.');
+await event({type:'image',id:'latest-a'},'latest-user');
+await event({type:'image',id:'latest-b'},'latest-user');
+const beforeLatest = ocrCalls;
+await event({type:'text',id:'latest-command',text:'Read only latest doc.'},'latest-user');
+await Promise.all(tasks);
+assert.equal(ocrCalls, beforeLatest + 1, 'latest command must OCR only one image');
+assert.ok(replies.at(-1).messages[0].quickReply.items.some(i => i.action.text === 'อ่านเฉพาะเอกสารล่าสุด'));
+const latestState = await (await env.DOCUMENTS.get('user-state/latest-user.json')).json();
+assert.equal(await env.DOCUMENTS.get(`${latestState.caseId}/files/latest-a.jpg.ocr.json`), null);
+assert.ok(await env.DOCUMENTS.get(`${latestState.caseId}/files/latest-b.jpg.ocr.json`));
+console.log('PASS: English latest-only command, older image excluded, actionable quick replies.');
+
