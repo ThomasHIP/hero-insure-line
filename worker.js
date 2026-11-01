@@ -85,6 +85,85 @@ async function handleWebhook(request, env) {
   }
 }
 
+
+const DOC_ROLES = { REGISTRATION: "หน้าทะเบียนรถ", POLICY: "กรมธรรม์เดิม/ปัจจุบัน", IDENTITY: "บัตรประชาชนหรือใบขับขี่" };
+function missingIntake(record) {
+  const has = role => record.documents.some(d => d.storage === "R2" && d.intakeRole === role);
+  return [!has("REGISTRATION") && "REGISTRATION", !has("POLICY") && !record.noPreviousPolicy && "POLICY", !has("IDENTITY") && "IDENTITY", !record.postalContact && "CONTACT"].filter(Boolean);
+}
+function intakePrompt(record) {
+  const next = missingIntake(record)[0];
+  const intro = "📋 เอกสารสำหรับเคส " + record.caseId + "\n1. หน้าทะเบียนรถ\n2. กรมธรรม์เดิม/ปัจจุบัน\n3. บัตรประชาชนหรือใบขับขี่\n4. ชื่อและที่อยู่จัดส่ง พร้อมมือถือและอีเมล\n\n";
+  if (next === "REGISTRATION") return intro + "ขั้นตอน 1/4: ส่งภาพหน้าทะเบียนรถในแชตนี้";
+  if (next === "POLICY") return intro + "ขั้นตอน 2/4: ส่งกรมธรรม์เดิม/ปัจจุบัน หากไม่มี พิมพ์ ไม่มีกรมธรรม์เดิม";
+  if (next === "IDENTITY") return intro + "ขั้นตอน 3/4: ส่งภาพบัตรประชาชนหรือใบขับขี่ เอกสารนี้เก็บเป็นส่วนตัวให้เจ้าหน้าที่ตรวจสอบ";
+  if (next === "CONTACT") return intro + contactPrompt();
+  return intakeSummary(record);
+}
+function contactPrompt() {
+  return "ขั้นตอน 4/4: พิมพ์ข้อมูลจัดส่งตามแบบนี้ (แก้ไขได้ภายหลัง)\nชื่อ: ชื่อ นามสกุล\nที่อยู่: บ้านเลขที่ ถนน แขวง/ตำบล เขต/อำเภอ จังหวัด รหัสไปรษณีย์\nมือถือ: 08xxxxxxxx\nอีเมล: name@example.com";
+}
+function intakeSummary(record) {
+  const missing = missingIntake(record);
+  if (missing.length) return "ยังส่งคำขอไม่ได้ ขาด: " + missing.map(key => DOC_ROLES[key] || "ข้อมูลจัดส่ง").join(", ") + "\n\n" + intakePrompt(record);
+  const c = record.postalContact;
+  return ["📋 ตรวจสอบก่อนส่งคำขอ • " + record.caseId,
+    ...Object.entries(DOC_ROLES).map(([role,label]) => label + ": " + (record.documents.some(d => d.storage === "R2" && d.intakeRole === role) ? "ได้รับแล้ว (รอเจ้าหน้าที่ตรวจสอบ)" : "แจ้งว่าไม่มีกรมธรรม์เดิม")),
+    "", "ชื่อ: " + c.name, "ที่อยู่: " + c.address, "มือถือ: " + c.mobile, "อีเมล: " + c.email,
+    "", "แก้ไขข้อมูลจัดส่ง: พิมพ์ ข้อมูลจัดส่ง แล้วกรอกใหม่",
+    "เพิ่ม/เปลี่ยนเอกสาร: เลือกประเภทเอกสาร แล้วส่งภาพใหม่",
+    "หากถูกต้อง พิมพ์ ยืนยันส่งคำขอ"].join("\n");
+}
+async function handleIntakeText(event, env, userId, state, originalText) {
+  const text = originalText.toLowerCase();
+  const role = { "ส่งทะเบียนรถ": "REGISTRATION", "ส่งกรมธรรม์": "POLICY", "ส่งบัตรหรือใบขับขี่": "IDENTITY" }[text];
+  const contactInput = /^(?:ชื่อ|name)\s*[:：]/i.test(originalText) || /^(?:ข้อมูลจัดส่ง|แก้ไขข้อมูลจัดส่ง)\s*\n/.test(originalText);
+  if (!role && !["ไม่มีกรมธรรม์เดิม", "ข้อมูลจัดส่ง", "แก้ไขข้อมูลจัดส่ง", "ยืนยันส่งคำขอ"].includes(text) && !contactInput) return false;
+  const record = state?.caseId ? await loadCase(env, state.caseId) : await getOrCreateOpenCase(env, userId, "DOCUMENT_ASSISTED", "LINE_INTAKE");
+  if (!record) { await reply(event.replyToken, "กรุณาพิมพ์ 5 เพื่อเริ่มส่งเอกสาร", env.LINE_CHANNEL_ACCESS_TOKEN); return true; }
+  if (role) {
+    await setUserState(env, userId, { ...state, caseId: record.caseId, intakeRole: role, mode: "WAITING_DOCUMENTS" });
+    await reply(event.replyToken, "กรุณาส่ง " + DOC_ROLES[role] + " ในแชตนี้", env.LINE_CHANNEL_ACCESS_TOKEN);
+  } else if (text === "ไม่มีกรมธรรม์เดิม") {
+    record.noPreviousPolicy = true;
+    await saveCase(env, record);
+    await setUserState(env, userId, { ...state, caseId: record.caseId, intakeRole: null });
+    await reply(event.replyToken, intakePrompt(record), env.LINE_CHANNEL_ACCESS_TOKEN);
+  } else if (text === "ข้อมูลจัดส่ง" || text === "แก้ไขข้อมูลจัดส่ง") {
+    await reply(event.replyToken, contactPrompt(), env.LINE_CHANNEL_ACCESS_TOKEN);
+  } else if (text === "ยืนยันส่งคำขอ") {
+    if (missingIntake(record).length) { await reply(event.replyToken, intakeSummary(record), env.LINE_CHANNEL_ACCESS_TOKEN); return true; }
+    record.postalContact.confirmedAt = nowIso();
+    record.status = "READY_FOR_REVIEW";
+    record.updatedAt = nowIso();
+    record.timeline.push(eventLog("CUSTOMER_INTAKE_CONFIRMED"));
+    await saveCase(env, record);
+    await setUserState(env, userId, { ...state, caseId: record.caseId, mode: "CASE_SUBMITTED", intakeRole: null });
+    await reply(event.replyToken, "✅ ส่งคำขอและยืนยันข้อมูลจัดส่งแล้ว\nหมายเลขเคส: " + record.caseId + "\nเจ้าหน้าที่จะตรวจเอกสารและติดต่อกลับ", env.LINE_CHANNEL_ACCESS_TOKEN);
+  } else {
+    const values = {};
+    let active;
+    for (const line of originalText.split(/\r?\n/)) {
+      const match = line.match(/^\s*(ชื่อ|name|ที่อยู่|address|มือถือ|โทรศัพท์|mobile|อีเมล|email)\s*[:：]\s*(.*)$/i);
+      if (match) {
+        active = { "ชื่อ":"name",name:"name","ที่อยู่":"address",address:"address","มือถือ":"mobile","โทรศัพท์":"mobile",mobile:"mobile","อีเมล":"email",email:"email" }[match[1].toLowerCase()];
+        values[active] = match[2].trim();
+      } else if (active === "address" && line.trim()) values.address += "\n" + line.trim();
+    }
+    const mobile = (values.mobile || "").replace(/[\s()-]/g, "").replace(/^\+66/, "0");
+    if (!values.name || values.name.length > 200 || !values.address || values.address.length > 2000 || !/^0\d{9}$/.test(mobile) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email || "") || values.email.length > 254) {
+      await reply(event.replyToken, "ข้อมูลยังไม่ครบหรือรูปแบบไม่ถูกต้อง กรุณากรอกชื่อ ที่อยู่ มือถือ 10 หลัก และอีเมล\n\n" + contactPrompt(), env.LINE_CHANNEL_ACCESS_TOKEN); return true;
+    }
+    record.postalContact = { name: values.name, address: values.address, mobile, email: values.email, updatedAt: nowIso() };
+    record.status = "DOCUMENTS_RECEIVING";
+    record.timeline.push(eventLog("POSTAL_CONTACT_UPDATED"));
+    await saveCase(env, record);
+    await setUserState(env, userId, { ...state, caseId: record.caseId, intakeRole: null });
+    await reply(event.replyToken, intakeSummary(record), env.LINE_CHANNEL_ACCESS_TOKEN);
+  }
+  return true;
+}
+
 async function processEvent(event, env) {
   const userId = event?.source?.userId;
   if (!userId || !event?.replyToken) return;
@@ -118,6 +197,8 @@ async function processEvent(event, env) {
     await reply(event.replyToken, mainMenu(), env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
+
+  if (await handleIntakeText(event, env, userId, state, originalText)) return;
 
   if (text === "1") {
     const caseRecord = await getOrCreateOpenCase(env, userId, "PRB", "LINE_MENU_1");
@@ -182,26 +263,7 @@ async function processEvent(event, env) {
       caseId: caseRecord.caseId,
       product: "DOCUMENT_ASSISTED"
     });
-    await reply(
-      event.replyToken,
-      [
-        "📄 ส่งเอกสารผ่าน LINE / ติดต่อเจ้าหน้าที่",
-        "",
-        `หมายเลขเคส: ${caseRecord.caseId}`,
-        "",
-        "ส่งรูปเอกสารในแชตนี้ได้ทันที:",
-        "• เล่มทะเบียนรถ",
-        "• กรมธรรม์ พ.ร.บ. เดิม",
-        "• กรมธรรม์ภาคสมัครใจเดิม",
-        "• เอกสารอื่นที่เกี่ยวข้อง",
-        "",
-        "เมื่อส่งครบแล้ว พิมพ์:",
-        "ส่งเอกสารครบแล้ว",
-        "",
-        "ระบบจะนำเอกสารทั้งหมดเข้าคิวให้เจ้าหน้าที่ตรวจสอบ"
-      ].join("\n"),
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
+    await reply(event.replyToken, intakePrompt(caseRecord), env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
@@ -250,17 +312,7 @@ async function processEvent(event, env) {
       await reply(event.replyToken, "ยังมีไฟล์ที่บันทึกไม่สำเร็จ กรุณาส่งไฟล์นั้นใหม่ก่อนส่งตรวจสอบ", env.LINE_CHANNEL_ACCESS_TOKEN);
       return;
     }
-    caseRecord.status = "READY_FOR_REVIEW";
-    caseRecord.priority = "HIGH";
-    caseRecord.updatedAt = nowIso();
-    caseRecord.timeline.push(eventLog("CUSTOMER_DOCUMENTS_COMPLETE"));
-    await saveCase(env, caseRecord);
-    await setUserState(env, userId, { mode: "CASE_SUBMITTED", caseId: caseRecord.caseId });
-    await reply(
-      event.replyToken,
-      `✅ รับเอกสารครบแล้ว\n\nหมายเลขเคส: ${caseRecord.caseId}\nเอกสาร: ${caseRecord.documents.length} รายการ\n\nเจ้าหน้าที่ HERO Insure จะตรวจสอบและติดต่อกลับ`,
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
+    await reply(event.replyToken, intakeSummary(caseRecord), env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
@@ -287,6 +339,7 @@ async function handleDocumentMessage(event, env, userId, state) {
     type: event.message.type,
     fileName: event.message.fileName || `line-document-${documentNumber}`,
     receivedAt: nowIso(),
+    intakeRole: state?.intakeRole || missingIntake(caseRecord).find(role => role !== "CONTACT") || "ADDITIONAL",
     storage: "LINE_TEMPORARY",
     r2Key: null
   };
@@ -339,6 +392,7 @@ async function handleDocumentMessage(event, env, userId, state) {
   caseRecord.documents = caseRecord.documents.filter(d => d.id !== document.id);
   caseRecord.documents.push(document);
   if (document.storage === "R2") await env.DOCUMENTS.put(`${caseRecord.caseId}/documents/${encodeURIComponent(document.id)}.json`, JSON.stringify(document), { httpMetadata: { contentType: "application/json" } });
+  if (document.storage === "R2" && document.intakeRole === "POLICY") caseRecord.noPreviousPolicy = false;
   caseRecord.status = "DOCUMENTS_RECEIVING";
   caseRecord.updatedAt = nowIso();
   caseRecord.timeline.push(eventLog(document.storage === "R2" ? "DOCUMENT_STORED" : "DOCUMENT_STORAGE_FAILED", { documentId: document.id, count: caseRecord.documents.length }));
@@ -367,7 +421,8 @@ async function handleDocumentMessage(event, env, userId, state) {
       caseRecord.ocrConsentAt ? "ระบบอ่านข้อมูลและรอเจ้าหน้าที่ตรวจสอบ" : "หากยินยอมส่งภาพให้ OpenAI อ่านข้อมูล พิมพ์: ยินยอมอ่านเอกสาร",
       "ส่งเอกสารเพิ่มเติมได้ต่อเนื่อง",
       "เมื่อครบแล้ว พิมพ์: ส่งเอกสารครบแล้ว",
-      customerOcrText
+      customerOcrText,
+      document.storage === "R2" ? intakePrompt(caseRecord) : ""
     ].join("\n").slice(0, 4900),
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
@@ -553,23 +608,7 @@ function mainMenu() {
   ].join("\n");
 }
 
-function productDocumentPrompt(caseRecord, productName) {
-  return [
-    `🛡️ ${productName}`,
-    "",
-    `หมายเลขเคส: ${caseRecord.caseId}`,
-    "",
-    "ส่งเอกสารผ่าน LINE ได้ทันที หรือใช้หน้าอัปโหลด:",
-    `https://hero-insure.pages.dev/upload/?case=${encodeURIComponent(caseRecord.caseId)}`,
-    "",
-    "เอกสารที่ควรเตรียม:",
-    "• เล่มทะเบียนรถ",
-    "• กรมธรรม์เดิม ถ้ามี",
-    "• บัตรประชาชน เมื่อเจ้าหน้าที่ร้องขอ",
-    "",
-    "เมื่อส่งทาง LINE ครบแล้ว พิมพ์: ส่งเอกสารครบแล้ว"
-  ].join("\n");
-}
+function productDocumentPrompt(caseRecord, productName) { return "🛡️ " + productName + "\n\n" + intakePrompt(caseRecord); }
 
 async function getOrCreateOpenCase(env, userId, product, source, persist = true) {
   ensureKv(env);
@@ -692,7 +731,7 @@ async function reply(replyToken, text, token) {
   const response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ replyToken, messages: [{ type: "text", text, quickReply: { items: [ ["ยินยอมอ่านล่าสุด", "อ่านเฉพาะเอกสารล่าสุด"], ["ยินยอมอ่านทุกภาพ", "ยินยอมอ่านเอกสาร"], ["ส่งเอกสารครบแล้ว", "ส่งเอกสารครบแล้ว"], ["ยืนยันข้อมูล", "ยืนยันข้อมูล"], ["แก้ไขข้อมูล", "แก้ไข"], ["เมนูหลัก", "เมนู"] ].map(([label, command]) => ({ type: "action", action: { type: "message", label, text: command } })) } }] })
+    body: JSON.stringify({ replyToken, messages: [{ type: "text", text, quickReply: { items: [ ["ยินยอมอ่านล่าสุด", "อ่านเฉพาะเอกสารล่าสุด"], ["ยินยอมอ่านทุกภาพ", "ยินยอมอ่านเอกสาร"], ["ส่งเอกสารครบแล้ว", "ส่งเอกสารครบแล้ว"], ["ยืนยันข้อมูล", "ยืนยันข้อมูล"], ["แก้ไขข้อมูล", "แก้ไข"], ["ทะเบียนรถ", "ส่งทะเบียนรถ"], ["กรมธรรม์", "ส่งกรมธรรม์"], ["บัตร/ใบขับขี่", "ส่งบัตรหรือใบขับขี่"], ["ข้อมูลจัดส่ง", "ข้อมูลจัดส่ง"], ["ไม่มีกรมธรรม์เดิม", "ไม่มีกรมธรรม์เดิม"], ["ยืนยันส่งคำขอ", "ยืนยันส่งคำขอ"], ["เมนูหลัก", "เมนู"] ].map(([label, command]) => ({ type: "action", action: { type: "message", label, text: command } })) } }] })
   });
   if (!response.ok) throw new Error(`LINE reply failed: ${response.status}`);
 }
@@ -793,6 +832,11 @@ async function runCaseOcr(env, caseId) {
 }
 
 async function extractDocument(env, document) {
+  if (document.intakeRole === "IDENTITY") {
+    const result = { status: "MANUAL_REVIEW", reason: "IDENTITY_STAFF_REVIEW", needsReview: true, updatedAt: nowIso() };
+    await env.DOCUMENTS.put(`${document.r2Key}.ocr.json`, JSON.stringify(result), { httpMetadata: { contentType: "application/json" } });
+    return result;
+  }
   const object = await env.DOCUMENTS.get(document.r2Key);
   if (!object) throw new Error("R2_VERIFICATION_FAILED");
   let result;
@@ -839,6 +883,7 @@ const OCR_LABELS = {
 
 function formatOcrText(record, document, result, customerReview = document.customerReview) {
   const heading = "📄 ผลอ่านเอกสาร • " + record.caseId + "\nไฟล์: " + document.fileName;
+  if (result?.reason === "IDENTITY_STAFF_REVIEW") return heading + "\nบันทึกบัตรประชาชน/ใบขับขี่แล้ว รอเจ้าหน้าที่ตรวจสอบ";
   if (result?.status !== "EXTRACTED") return heading + "\n⚠️ ยังอ่านข้อมูลไม่ได้ กรุณาส่งภาพ JPG/PNG/WebP ที่ชัดเจน ขนาดไม่เกิน 5 MB หรือติดต่อเจ้าหน้าที่ พิมพ์ 5";
   const fields = { ...result.fields, ...customerReview?.fields };
   const rows = Object.entries(OCR_LABELS).filter(([key]) => fields[key]).map(([key, label]) => label + ": " + fields[key]);
@@ -940,10 +985,12 @@ async function adminOcr(request, env, url) {
 }
 
 function documentReviewHtml(record, key, origin) {
-  return (record.documents || []).map(document => {
+  const contact = record.postalContact;
+  const contactHtml = contact ? `<section><h4>Postal contact</h4><p>${escapeHtml(contact.name)}<br>${escapeHtml(contact.address)}<br>${escapeHtml(contact.mobile)}<br>${escapeHtml(contact.email)}</p><p>Customer confirmed: ${escapeHtml(contact.confirmedAt || "PENDING")}</p></section>` : "";
+  return contactHtml + (record.documents || []).map(document => {
     const base = `${origin}/admin/document/${encodeURIComponent(record.caseId)}/${encodeURIComponent(document.id)}?key=${encodeURIComponent(key)}`;
     const fields = { ...document.ocr?.fields, ...document.customerReview?.fields, ...document.review?.fields };
-    return `<details><summary>Document: ${escapeHtml(document.fileName)} — ${escapeHtml(document.storage)} / OCR ${escapeHtml(document.ocr?.status || (record.ocrConsentAt ? "PENDING" : "AWAITING_CONSENT"))} / ${escapeHtml(document.review?.status || "PENDING")}</summary>
+    return `<details><summary>Document: ${escapeHtml(DOC_ROLES[document.intakeRole] || "Additional")} — ${escapeHtml(document.fileName)} — ${escapeHtml(document.storage)} / OCR ${escapeHtml(document.ocr?.status || (record.ocrConsentAt ? "PENDING" : "AWAITING_CONSENT"))} / ${escapeHtml(document.review?.status || "PENDING")}</summary>
       ${document.storage === "R2" ? `<a href="${escapeHtml(base)}" rel="noreferrer">Download private original</a>` : "Storage failed: ask customer to resend"}
       <p>Customer confirmation: ${escapeHtml(document.customerReview?.status || "PENDING")}</p><p>${escapeHtml(document.ocr?.reason || "")}</p><p>${escapeHtml((document.ocr?.warnings || []).join(" • "))}</p>
       ${document.storage === "R2" ? `<form method="post" action="${origin}/admin/document/${encodeURIComponent(record.caseId)}/${encodeURIComponent(document.id)}/review?key=${encodeURIComponent(key)}">
