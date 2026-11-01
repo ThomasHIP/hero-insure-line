@@ -5,5 +5,17 @@
   "compatibility_date": "2026-08-03",
   "observability": {
     "enabled": true
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "CASES",
+      "id": "84090974ff9046c2a1c81545b2550a64"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "DOCUMENTS",
+      "bucket_name": "hero-insure-documents"
+    }
+  ]
 }
