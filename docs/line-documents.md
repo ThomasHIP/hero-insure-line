@@ -44,3 +44,10 @@ Corrections use a message such as:
 Only named supported vehicle/policy fields are accepted. Invalid corrections are rejected without partial writes. The customer then sends “ยืนยันข้อมูล”. Editing and confirmation apply to the most recent successfully read document selected for review. The private .customer.json sidecar preserves customer changes separately from original .ocr.json output and staff .review.json verification. The protected admin dashboard shows customer corrections and confirmation status; customer confirmation never marks staff verification complete.
 
 The upload is first saved as a durable private R2 job before webhook acknowledgement. Background event processing handles the LINE reply; the existing worker cron retries pending jobs. A LINE reply token can expire on a delayed retry, so saved data and delivery confirmation remain separate outcomes. No customer data is exposed by public health diagnostics.
+
+
+## Four-step LINE document intake
+
+Menus 1, 2 and 5 now guide: (1) car registration page, (2) previous/current policy or explicit “ไม่มีกรมธรรม์เดิม”, (3) ID card or driving licence, (4) recipient name, full postal address, mobile and email. New documents carry an intakeRole. Customers may choose a category explicitly before uploading additional pages. Automatic category assignment follows the next missing step; it is not a document-content authenticity check. Staff must verify the original documents.
+
+Identity images are stored privately for staff review and never sent to the vehicle OCR endpoint. Contact data is entered using ชื่อ:, ที่อยู่:, มือถือ:, อีเมล:. Mobile and email format and mandatory fields are validated; changing contact data clears its prior confirmation. “ส่งเอกสารครบแล้ว” shows outstanding steps or a final summary. Only “ยืนยันส่งคำขอ”, after all required items are present, marks the case READY_FOR_REVIEW and confirms postal contact. Staff can view the postal contact and document categories in the protected admin dashboard. Legacy uncategorized files are retained and do not automatically satisfy a named category.
