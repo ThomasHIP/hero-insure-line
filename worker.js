@@ -27,6 +27,8 @@ export default {
       return handleWebhook(request, env);
     }
 
+    if (url.pathname.startsWith("/customer/")) return handleCustomer(request, env, url);
+
     if (url.pathname.startsWith("/admin/document/")) return adminDocument(request, env, url);
     if (url.pathname.startsWith("/admin/ocr/")) return adminOcr(request, env, url);
 
@@ -45,6 +47,151 @@ export default {
     return json({ success: false, error: "Not found" }, 404);
   }
 };
+
+
+const CUSTOMER_ORIGIN = "https://hero-insure.pages.dev";
+const CUSTOMER_LIMIT = 5 * 1024 * 1024;
+async function customerTokenKey(token) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+async function createCustomerLink(env, record) {
+  const token = crypto.randomUUID() + crypto.randomUUID();
+  await env.DOCUMENTS.put("_customer-sessions/" + await customerTokenKey(token) + ".json", JSON.stringify({ caseId: record.caseId, expiresAt: Date.now() + 86400000 }), { httpMetadata: { contentType: "application/json" } });
+  return CUSTOMER_ORIGIN + "/upload/#token=" + token;
+}
+function customerView(record) {
+  return {
+    caseId: record.caseId, status: record.status,
+    contact: record.postalContact || null, noPreviousPolicy: Boolean(record.noPreviousPolicy),
+    documents: record.documents.filter(d => d.storage === "R2").map(d => ({
+      id: d.id, role: d.intakeRole || "ADDITIONAL", name: d.fileName, size: d.size,
+      ocr: d.ocr ? { status: d.ocr.status, fields: d.ocr.fields || {}, warnings: d.ocr.warnings || [] } : null,
+      customerReview: d.customerReview || null
+    }))
+  };
+}
+function validPostalContact(input) {
+  if (!input || typeof input !== "object") return null;
+  const value = Object.fromEntries(["name","address","mobile","email"].map(key => [key, String(input[key] || "").trim()]));
+  value.mobile = value.mobile.replace(/[\s()-]/g, "").replace(/^\+66/, "0");
+  if (!value.name || value.name.length > 200 || !value.address || value.address.length > 2000 || !/^0\d{9}$/.test(value.mobile) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.email) || value.email.length > 254) return null;
+  return value;
+}
+function fileKind(bytes) {
+  if (bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return ["image/jpeg","jpg"];
+  if ([137,80,78,71,13,10,26,10].every((byte,index) => bytes[index] === byte)) return ["image/png","png"];
+  const ascii = new TextDecoder().decode(bytes.slice(0,12));
+  if (ascii.startsWith("RIFF") && ascii.slice(8) === "WEBP") return ["image/webp","webp"];
+  if (ascii.startsWith("%PDF-")) return ["application/pdf","pdf"];
+  return null;
+}
+async function handleCustomer(request, env, url) {
+  try {
+    if (request.headers.get("origin") && request.headers.get("origin") !== CUSTOMER_ORIGIN) return json({ error: "ORIGIN_DENIED" },403);
+    if (!env.DOCUMENTS || !env.CASES) return json({error:"STORAGE_UNAVAILABLE"},503);
+    const action = url.pathname.slice("/customer/".length);
+    if (action === "start" && request.method === "POST") {
+      // New website visitors get an isolated case, never another customer's case.
+      const ip = request.headers.get("x-customer-ip") || request.headers.get("cf-connecting-ip") || "unknown";
+      const rateKey = "_customer-rates/" + new Date().toISOString().slice(0,10) + "/" + await customerTokenKey(ip) + ".json";
+      const rateObject = await env.DOCUMENTS.get(rateKey);
+      const rate = rateObject ? await rateObject.json() : { count: 0 };
+      if (rate.count >= 30) return json({error:"TRY_LATER"},429);
+      await env.DOCUMENTS.put(rateKey,JSON.stringify({count:rate.count+1}),{httpMetadata:{contentType:"application/json"}});
+      const record = { caseId: generateCaseId(), lineUserId: null, product:"DOCUMENT_ASSISTED", source:"WEB_UPLOAD", status:"OPEN", priority:"NORMAL", documents:[], voucher:null, assignedTo:"", adminNote:"", createdAt:nowIso(), updatedAt:nowIso(), timeline:[eventLog("WEB_CASE_CREATED")] };
+      await saveCase(env,record);
+      const link = await createCustomerLink(env,record);
+      return json({ token:link.split("#token=")[1], ...customerView(record) });
+    }
+    const token = (request.headers.get("authorization") || "").replace(/^Bearer /,"");
+    if (!/^[a-f0-9-]{72}$/.test(token)) return json({error:"INVALID_SESSION"},401);
+    const sessionObject = await env.DOCUMENTS.get("_customer-sessions/" + await customerTokenKey(token) + ".json");
+    const session = sessionObject ? await sessionObject.json() : null;
+    if (!session || session.expiresAt <= Date.now()) return json({error:"SESSION_EXPIRED"},401);
+    const record = await loadCase(env,session.caseId);
+    if (!record) return json({error:"CASE_NOT_FOUND"},404);
+    if (action === "session" && request.method === "GET") return json(customerView(record));
+    if (request.method !== "POST") return json({error:"METHOD_NOT_ALLOWED"},405);
+    if (["COMPLETED","CANCELLED"].includes(record.status)) return json({error:"CASE_CLOSED"},409);
+    if (action === "upload") {
+      if (Number(request.headers.get("content-length") || 0) > CUSTOMER_LIMIT + 100000) return json({error:"FILE_TOO_LARGE"},413);
+      const form = await request.formData();
+      const role = String(form.get("role") || "");
+      const id = String(form.get("uploadId") || "");
+      const file = form.get("file");
+      if (!DOC_ROLES[role] || !/^[a-zA-Z0-9-]{8,80}$/.test(id) || !file || typeof file.arrayBuffer !== "function") return json({error:"INVALID_UPLOAD"},400);
+      const existing = record.documents.find(d => d.id === "web-"+id && d.storage === "R2");
+      if (existing) return json(customerView(record));
+      if (!file.size || file.size > CUSTOMER_LIMIT) return json({error:"FILE_TOO_LARGE"},413);
+      if (record.documents.length >= 40) return json({error:"DOCUMENT_LIMIT"},400);
+      const bytes = await file.arrayBuffer();
+      const kind = fileKind(new Uint8Array(bytes));
+      if (!kind) return json({error:"UNSUPPORTED_FILE"},415);
+      const document = { id:"web-"+id, type:kind[0].startsWith("image/")?"image":"file", fileName:String(file.name || "document").slice(0,150), intakeRole:role, receivedAt:nowIso(), storage:"R2", r2Key:record.caseId+"/files/web-"+id+"."+kind[1], contentType:kind[0], size:bytes.byteLength };
+      await env.DOCUMENTS.put(document.r2Key,bytes,{httpMetadata:{contentType:kind[0]}});
+      const check = await env.DOCUMENTS.head(document.r2Key);
+      if (!check || check.size !== bytes.byteLength) throw Error("R2_VERIFICATION_FAILED");
+      document.verifiedAt=nowIso();
+      await env.DOCUMENTS.put(record.caseId+"/documents/"+encodeURIComponent(document.id)+".json",JSON.stringify(document),{httpMetadata:{contentType:"application/json"}});
+      record.documents.push(document);
+      if (role === "POLICY") record.noPreviousPolicy=false;
+      record.status="DOCUMENTS_RECEIVING"; record.updatedAt=nowIso();
+      record.timeline.push(eventLog("WEB_DOCUMENT_STORED",{documentId:document.id,role}));
+      await saveCase(env,record);
+      return json(customerView(record));
+    }
+    const input = await request.json();
+    if (action === "policy") {
+      record.noPreviousPolicy=input.noPreviousPolicy === true;
+      record.updatedAt=nowIso(); await saveCase(env,record);
+      return json(customerView(record));
+    }
+    if (action === "details") {
+      const contact = validPostalContact(input.contact);
+      if (!contact) return json({error:"INVALID_CONTACT"},400);
+      record.postalContact={...contact,updatedAt:nowIso()};
+      record.noPreviousPolicy=input.noPreviousPolicy === true;
+      record.status="DOCUMENTS_RECEIVING"; record.updatedAt=nowIso();
+      await saveCase(env,record);
+      return json(customerView(record));
+    }
+    if (action === "ocr" || action === "review") {
+      const document = record.documents.find(d => d.id === input.documentId && d.storage === "R2");
+      if (!document) return json({error:"DOCUMENT_NOT_FOUND"},404);
+      if (action === "ocr") {
+        if (input.consent !== true) return json({error:"CONSENT_REQUIRED"},400);
+        if (document.intakeRole === "IDENTITY") return json({error:"IDENTITY_MANUAL_REVIEW"},400);
+        record.ocrConsentAt=nowIso(); await saveCase(env,record);
+        if (!document.ocr || document.ocr.status === "FAILED") document.ocr=await extractDocument(env,document);
+      } else {
+        if (document.ocr?.status !== "EXTRACTED") return json({error:"OCR_REQUIRED"},409);
+        const fields={};
+        for (const [key,value] of Object.entries(input.fields || {})) {
+          if (!OCR_FIELDS.includes(key) || typeof value !== "string" || value.length>300) return json({error:"INVALID_FIELDS"},400);
+          fields[key]=value.trim();
+        }
+        const customer={fields,status:input.confirmed === true?"CUSTOMER_CONFIRMED":"EDITED",updatedAt:nowIso(),...(input.confirmed === true?{confirmedAt:nowIso()}:{})};
+        await env.DOCUMENTS.put(document.r2Key+".customer.json",JSON.stringify(customer),{httpMetadata:{contentType:"application/json"}});
+        document.customerReview=customer;
+      }
+      return json(customerView(record));
+    }
+    if (action === "submit") {
+      const missing=missingIntake(record);
+      if (missing.length) return json({error:"INCOMPLETE",missing},400);
+      if (input.confirmed !== true) return json({error:"CONFIRMATION_REQUIRED"},400);
+      record.postalContact.confirmedAt=nowIso(); record.status="READY_FOR_REVIEW"; record.updatedAt=nowIso();
+      record.timeline.push(eventLog("WEB_CUSTOMER_INTAKE_CONFIRMED"));
+      await saveCase(env,record);
+      return json(customerView(record));
+    }
+    return json({error:"NOT_FOUND"},404);
+  } catch (error) {
+    console.error("Customer upload operation failed",{reason:safeError(error)});
+    return json({error:"REQUEST_FAILED"},503);
+  }
+}
 
 async function handleWebhook(request, env) {
   try {
@@ -207,7 +354,7 @@ async function processEvent(event, env) {
       caseId: caseRecord.caseId,
       product: "PRB"
     });
-    await reply(event.replyToken, productDocumentPrompt(caseRecord, "ประกันภัย พ.ร.บ."), env.LINE_CHANNEL_ACCESS_TOKEN);
+    await reply(event.replyToken, await customerWebPrompt(env, caseRecord, "ประกันภัย พ.ร.บ."), env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
@@ -218,7 +365,7 @@ async function processEvent(event, env) {
       caseId: caseRecord.caseId,
       product: "VOLUNTARY"
     });
-    await reply(event.replyToken, productDocumentPrompt(caseRecord, "ประกันภัยรถยนต์ภาคสมัครใจ"), env.LINE_CHANNEL_ACCESS_TOKEN);
+    await reply(event.replyToken, await customerWebPrompt(env, caseRecord, "ประกันภัยรถยนต์ภาคสมัครใจ"), env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
@@ -263,7 +410,7 @@ async function processEvent(event, env) {
       caseId: caseRecord.caseId,
       product: "DOCUMENT_ASSISTED"
     });
-    await reply(event.replyToken, intakePrompt(caseRecord), env.LINE_CHANNEL_ACCESS_TOKEN);
+    await reply(event.replyToken, await customerWebPrompt(env, caseRecord, "ส่งเอกสาร HERO Insure"), env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
@@ -606,6 +753,11 @@ function mainMenu() {
     "",
     "พิมพ์ตัวเลข 1–5 ได้ทันที"
   ].join("\n");
+}
+
+async function customerWebPrompt(env, record, title) {
+  const link = await createCustomerLink(env,record);
+  return "🛡️ " + title + "\nหมายเลขเคส: " + record.caseId + "\n\nกดลิงก์เพื่ออัปโหลดเอกสารและตรวจสอบข้อมูลทีละขั้นตอน:\n" + link + "\n\n1. หน้าทะเบียนรถ\n2. กรมธรรม์เดิม/ปัจจุบัน\n3. บัตรประชาชน/ใบขับขี่\n4. ชื่อ ที่อยู่จัดส่ง มือถือ และอีเมล\n\nลิงก์ส่วนตัวใช้ได้ 24 ชั่วโมง กรุณาไม่ส่งต่อ เมื่อครบแล้วกดยืนยันส่งคำขอบนหน้าเว็บ";
 }
 
 function productDocumentPrompt(caseRecord, productName) { return "🛡️ " + productName + "\n\n" + intakePrompt(caseRecord); }
