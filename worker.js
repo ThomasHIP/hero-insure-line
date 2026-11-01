@@ -11,7 +11,8 @@ export default {
       return json({
         success: true,
         service: "HERO Insure LINE Case System",
-        version: "case-admin-v1",
+        version: "storage-binding-check-v2",
+        bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) },
         status: "running",
         webhook: `${url.origin}/webhook`,
         admin: `${url.origin}/admin`
@@ -57,7 +58,7 @@ async function handleWebhook(request, env) {
     for (const result of results) {
       if (result.status === "rejected") {
         const match = String(result.reason).match(/LINE reply failed: (\d{3})/);
-        console.error("LINE event processing failed", { stage: match ? "REPLY" : "CASE_PROCESSING", status: match ? Number(match[1]) : null });
+        console.error("LINE event processing failed", { stage: match ? "REPLY" : "CASE_PROCESSING", reason: /binding CASES is missing/.test(String(result.reason)) ? "CASES_BINDING_MISSING" : /429|rate.limit|too many/i.test(String(result.reason)) ? "STORAGE_RATE_LIMIT" : "UNCLASSIFIED", status: match ? Number(match[1]) : null });
       }
     }
     return json({ success: true, processed: events.length });
