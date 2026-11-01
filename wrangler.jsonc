@@ -17,5 +17,10 @@
       "binding": "DOCUMENTS",
       "bucket_name": "hero-insure-documents"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
 }

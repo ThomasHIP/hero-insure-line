@@ -36,7 +36,10 @@ async function event(message,user='user-1') {
   const body=JSON.stringify({events:[{type:'message',source:{userId:user},replyToken:'test-reply',webhookEventId:'event-'+(++sequence),message}]});
   const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.LINE_CHANNEL_SECRET),{name:'HMAC',hash:'SHA-256'},false,['sign']);
   const signature=Buffer.from(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(body))).toString('base64');
-  return worker.fetch(new Request('https://worker.test/webhook',{method:'POST',headers:{'x-line-signature':signature},body}),env,ctx);
+  const start = tasks.length;
+  const response = await worker.fetch(new Request('https://worker.test/webhook',{method:'POST',headers:{'x-line-signature':signature},body}),env,ctx);
+  for (let index = start; index < tasks.length; index++) await tasks[index];
+  return response;
 }
 const unauth = await worker.fetch(new Request('https://worker.test/webhook',{method:'POST',body:'{}'}),env,ctx);
 assert.equal(unauth.status,401);

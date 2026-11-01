@@ -4,6 +4,7 @@ const VOUCHER_PREFIX = "voucher:";
 const ADMIN_SESSION_TTL = 60 * 60 * 12;
 
 export default {
+  async scheduled(controller, env, ctx) { ctx.waitUntil(drainLineJobs({ ...env, TASK_CONTEXT: ctx })); },
   async fetch(request, env, ctx) {
     env = { ...env, TASK_CONTEXT: ctx };
     const url = new URL(request.url);
@@ -12,7 +13,7 @@ export default {
       return json({
         success: true,
         service: "HERO Insure LINE Case System",
-        version: "line-upload-diagnostics-v5",
+        version: "line-durable-processing-v6",
         bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) },
         status: "running",
         webhook: `${url.origin}/webhook`,
@@ -59,26 +60,28 @@ async function handleWebhook(request, env) {
 
     const payload = JSON.parse(rawBody);
     const events = Array.isArray(payload.events) ? payload.events : [];
-    if (events.length) env = { ...env, PROCESSING_TRACE: { receivedAt: nowIso(), stage: "TOKEN" }, LINE_CHANNEL_ACCESS_TOKEN: await getLineToken(env) };
-
-    if (events.length) await persistProcessingTrace(env);
-    const results = [];
+    if (!events.length) return json({ success: true, accepted: 0 });
+    if (!env.DOCUMENTS) throw new Error("DOCUMENTS_BINDING_MISSING");
+    if (!env.TASK_CONTEXT?.waitUntil) throw new Error("BACKGROUND_CONTEXT_MISSING");
+    const keys = [];
     for (const event of events) {
-      try { await processEvent(event, env); results.push({ status: "fulfilled" }); }
-      catch (reason) { if (env.PROCESSING_TRACE) { env.PROCESSING_TRACE.failedStage = env.PROCESSING_TRACE.stage; env.PROCESSING_TRACE.error = safeError(reason); env.PROCESSING_TRACE.stage = "FAILED"; } results.push({ status: "rejected", reason }); }
-    }
-    for (const result of results) {
-      if (result.status === "rejected") {
-        const match = String(result.reason).match(/LINE reply failed: (\d{3})/);
-        console.error("LINE event processing failed", { stage: match ? "REPLY" : "CASE_PROCESSING", reason: /binding CASES is missing/.test(String(result.reason)) ? "CASES_BINDING_MISSING" : /429|rate.limit|too many/i.test(String(result.reason)) ? "STORAGE_RATE_LIMIT" : "UNCLASSIFIED", status: match ? Number(match[1]) : null });
+      const id = event.webhookEventId || event.message?.id;
+      if (!id) continue;
+      const key = "_queue/" + encodeURIComponent(id) + ".json";
+      const existing = await env.DOCUMENTS.get(key);
+      if (existing) {
+        const previous = await existing.json();
+        if (previous.status === "COMPLETED") continue;
+      } else {
+        await env.DOCUMENTS.put(key, JSON.stringify({ event, status: "PENDING", attempts: 0, createdAt: nowIso() }), { httpMetadata: { contentType: "application/json" } });
       }
+      keys.push(key);
     }
-    if (events.length) await persistProcessingTrace(env);
-    const failed = results.filter(r => r.status === "rejected").length;
-    return json({ success: failed === 0, processed: events.length - failed, failed }, failed ? 503 : 200);
+    env.TASK_CONTEXT.waitUntil((async () => { for (const key of keys) await runLineJob(env, key); })());
+    return json({ success: true, accepted: keys.length });
   } catch (error) {
     console.error("Webhook error", { reason: safeError(error) });
-    return json({ success: false, error: "WEBHOOK_PROCESSING_FAILED" }, 500);
+    return json({ success: false, error: "WEBHOOK_PROCESSING_FAILED" }, 503);
   }
 }
 
@@ -94,6 +97,7 @@ async function processEvent(event, env) {
   if (event.type !== "message") return;
 
   traceStage(env, "USER_STATE");
+  await persistProcessingTrace(env);
   const state = await getUserState(env, userId);
 
   if (event.message?.type === "image" || event.message?.type === "file") {
@@ -274,6 +278,7 @@ async function handleDocumentMessage(event, env, userId, state) {
   } else {
     try {
       traceStage(env, "LINE_DOWNLOAD");
+      await persistProcessingTrace(env);
       const response = await fetch(`https://api-data.line.me/v2/bot/message/${event.message.id}/content`, {
         headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }, signal: AbortSignal.timeout(15000)
       });
@@ -291,6 +296,7 @@ async function handleDocumentMessage(event, env, userId, state) {
         const key = `${caseRecord.caseId}/files/${encodeURIComponent(event.message.id)}.${extension}`;
         const bytes = await readDocumentBytes(response);
         traceStage(env, "R2_PUT");
+        await persistProcessingTrace(env);
         const stored = await env.DOCUMENTS.put(key, bytes, { httpMetadata: { contentType } });
         if (!stored) throw new Error("R2 put returned no object");
         document.storage = "R2";
@@ -322,6 +328,7 @@ async function handleDocumentMessage(event, env, userId, state) {
   if (document.storage === "R2" && caseRecord.ocrConsentAt) scheduleOcr(env, caseRecord.caseId);
 
   traceStage(env, "REPLY", { stored: document.storage === "R2" });
+  await persistProcessingTrace(env);
   await reply(
     event.replyToken,
     [
@@ -337,6 +344,7 @@ async function handleDocumentMessage(event, env, userId, state) {
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
   traceStage(env, document.storage === "R2" ? "STORED_AND_ACKNOWLEDGED" : "FAILED_AND_ACKNOWLEDGED");
+  if (document.storage !== "R2") throw new Error("DOCUMENT_STORAGE_RETRY_REQUIRED");
 }
 
 async function handleVoucherCode(event, env, userId, rawCode) {
@@ -667,7 +675,7 @@ function html(content, status = 200) { return new Response(content, { status, he
 
 let healthCache;
 async function health(env) {
-  if (healthCache && healthCache.until > Date.now()) return json({ ...healthCache.data, processing: await readProcessingTrace(env) });
+  if (healthCache && healthCache.until > Date.now()) return json({ ...healthCache.data, processing: await readProcessingTrace(env), storageTest: await readStorageTest(env) });
   let line = { tokenAccepted: false, accountMatches: false };
   try {
     const response = await fetch("https://api.line.me/v2/bot/info", {
@@ -911,4 +919,65 @@ async function readDocumentBytes(response) {
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
   return bytes.buffer;
+}
+
+async function runLineJob(bindings, key) {
+  const object = await bindings.DOCUMENTS.get(key);
+  if (!object) return;
+  const job = await object.json();
+  if (job.status === "COMPLETED" || job.attempts >= 4 || (job.notBefore && Date.parse(job.notBefore) > Date.now())) return;
+  job.attempts = (job.attempts || 0) + 1;
+  const env = { ...bindings, PROCESSING_TRACE: { receivedAt: job.createdAt, updatedAt: nowIso(), stage: "TOKEN", attempt: job.attempts } };
+  try {
+    await persistProcessingTrace(env);
+    env.LINE_CHANNEL_ACCESS_TOKEN = await getLineToken(env);
+    await processEvent(job.event, env);
+    job.status = "COMPLETED";
+    delete job.event;
+    job.completedAt = nowIso();
+  } catch (error) {
+    job.status = "PENDING";
+    job.notBefore = new Date(Date.now() + 60000).toISOString();
+    env.PROCESSING_TRACE.failedStage = env.PROCESSING_TRACE.stage;
+    env.PROCESSING_TRACE.stage = "FAILED";
+    env.PROCESSING_TRACE.error = safeError(error);
+    const status = String(error).match(/LINE reply failed: (\d{3})/);
+    if (status) env.PROCESSING_TRACE.replyStatus = Number(status[1]);
+    console.error("LINE durable job failed", { stage: env.PROCESSING_TRACE.failedStage, reason: env.PROCESSING_TRACE.error });
+  }
+  await bindings.DOCUMENTS.put(key, JSON.stringify(job), { httpMetadata: { contentType: "application/json" } });
+  await persistProcessingTrace(env);
+}
+async function drainLineJobs(env) {
+  if (!env.DOCUMENTS) return;
+  await verifyR2Storage(env);
+  const page = await env.DOCUMENTS.list({ prefix: "_queue/", limit: 100 });
+  for (const entry of page.objects) {
+    const object = await env.DOCUMENTS.get(entry.key);
+    if (!object) continue;
+    const job = await object.json();
+    if (job.status !== "COMPLETED" && (job.attempts || 0) < 4 && (!job.notBefore || Date.parse(job.notBefore) <= Date.now())) {
+      await runLineJob(env, entry.key);
+      break;
+    }
+  }
+}
+
+async function verifyR2Storage(env) {
+  const key = "_health/probe-" + crypto.randomUUID();
+  let result;
+  try {
+    const value = new TextEncoder().encode("hero-insure-storage-check");
+    await env.DOCUMENTS.put(key, value.buffer);
+    const object = await env.DOCUMENTS.get(key);
+    const bytes = object ? new Uint8Array(await object.arrayBuffer()) : null;
+    if (!bytes || bytes.length !== value.length || !bytes.every((byte, i) => byte === value[i])) throw new Error("R2_VERIFICATION_FAILED");
+    result = { verified: true, checkedAt: nowIso() };
+  } catch (error) { result = { verified: false, checkedAt: nowIso(), reason: safeError(error) }; }
+  finally { try { await env.DOCUMENTS.delete(key); } catch {} }
+  await env.DOCUMENTS.put("_health/storage-check.json", JSON.stringify(result), { httpMetadata: { contentType: "application/json" } });
+}
+async function readStorageTest(env) {
+  try { const object = await env.DOCUMENTS?.get("_health/storage-check.json"); return object ? await object.json() : null; }
+  catch { return null; }
 }
