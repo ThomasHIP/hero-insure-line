@@ -140,7 +140,7 @@ globalThis.fetch = workingFetch;
 console.log('PASS: admin sees customer corrections, consented uploads return text, provider failure shown clearly.');
 
 await event({type:'text',id:'intake-start',text:'5'},'intake-user');
-assert.match(replies.at(-1).messages[0].text,/ขั้นตอน 1\/4/);
+assert.match(replies.at(-1).messages[0].text,/https:\/\/hero-insure.pages.dev\/upload\/#token=/);
 await event({type:'image',id:'intake-reg'},'intake-user');
 assert.match(replies.at(-1).messages[0].text,/ขั้นตอน 2\/4/);
 await event({type:'text',id:'intake-no-policy',text:'ไม่มีกรมธรรม์เดิม'},'intake-user');
@@ -174,3 +174,47 @@ intakeRecord = await (await env.DOCUMENTS.get('case-index/'+intakeState.caseId+'
 assert.equal(intakeRecord.documents.at(-1).intakeRole,'POLICY');
 assert.equal(intakeRecord.noPreviousPolicy,false);
 console.log('PASS: ordered intake, policy absence, identity manual review, validated postal contact, confirmation, editing and explicit category.');
+
+async function webRequest(action, body, token) {
+  const headers={origin:'https://hero-insure.pages.dev'};
+  if(token)headers.authorization='Bearer '+token;
+  const options={method:body===undefined?'GET':'POST',headers};
+  if(body instanceof FormData)options.body=body;
+  else if(body!==undefined){headers['content-type']='application/json';options.body=JSON.stringify(body);}
+  return worker.fetch(new Request('https://worker.test/customer/'+action,options),env,ctx);
+}
+const guest = await (await webRequest('start',{})).json();
+assert.ok(guest.token);
+assert.equal((await webRequest('session')).status,401);
+assert.equal((await worker.fetch(new Request('https://worker.test/customer/session',{headers:{authorization:'Bearer '+guest.token,origin:'https://evil.test'}}),env,ctx)).status,403);
+async function webFile(role,id,token=guest.token,bytes=new Uint8Array([255,216,255,1,2,3])) {
+  const form=new FormData();form.set('role',role);form.set('uploadId',id);form.set('file',new Blob([bytes],{type:'image/jpeg'}),'test.jpg');
+  return webRequest('upload',form,token);
+}
+assert.equal((await webFile('REGISTRATION','registration-001')).status,200);
+assert.equal((await webFile('REGISTRATION','registration-001')).status,200);
+assert.equal((await (await webRequest('session',undefined,guest.token)).json()).documents.length,1,'upload retries idempotent');
+assert.equal((await webFile('POLICY','invalid-file-001',guest.token,new TextEncoder().encode('<html>bad</html>'))).status,415);
+assert.equal((await webRequest('submit',{confirmed:true},guest.token)).status,400,'incomplete intake blocked');
+await webRequest('policy',{noPreviousPolicy:true},guest.token);
+await webFile('IDENTITY','identity-001');
+assert.equal((await webRequest('details',{contact:{name:'test'}},guest.token)).status,400);
+await webRequest('details',{contact:{name:'Test Recipient',address:'123 Test Bangkok 10900',mobile:'0812345678',email:'test@example.com'},noPreviousPolicy:true},guest.token);
+assert.equal((await webRequest('ocr',{documentId:'web-registration-001',consent:false},guest.token)).status,400);
+const webOcr = await (await webRequest('ocr',{documentId:'web-registration-001',consent:true},guest.token)).json();
+assert.equal(webOcr.documents.find(d=>d.role==='REGISTRATION').ocr.fields.registration_number,'ทดสอบ 1234');
+const stranger=await (await webRequest('start',{})).json();
+assert.equal((await webRequest('review',{documentId:'web-registration-001',fields:{registration_number:'stolen'},confirmed:true},stranger.token)).status,404);
+assert.equal((await webRequest('review',{documentId:'web-registration-001',fields:{citizen_id:'123'},confirmed:true},guest.token)).status,400);
+await webRequest('review',{documentId:'web-registration-001',fields:{registration_number:'WEB 123'},confirmed:true},guest.token);
+const finalWeb = await (await webRequest('submit',{confirmed:true},guest.token)).json();
+assert.equal(finalWeb.status,'READY_FOR_REVIEW');
+assert.ok(finalWeb.contact.confirmedAt);
+assert.equal(finalWeb.documents[0].customerReview.fields.registration_number,'WEB 123');
+assert.equal(finalWeb.documents[0].ocr.fields.registration_number,'ทดสอบ 1234');
+assert.ok(!JSON.stringify(finalWeb).includes('r2Key'),'do not expose private storage keys');
+assert.equal((await webRequest('ocr',{documentId:'web-identity-001',consent:true},guest.token)).status,400);
+const lineLink = replies.findLast(r=>r.messages[0].text.includes('/upload/#token=')).messages[0].text.match(/#token=([a-f0-9-]+)/)[1];
+const linked=await (await webRequest('session',undefined,lineLink)).json();
+assert.equal(linked.caseId,intakeState.caseId,'LINE web link remains attached to existing case');
+console.log('PASS: private web sessions, linked LINE case, typed uploads, duplicate retry, file validation, consent, contact validation, cross-case isolation, OCR review and confirmed submission.');
