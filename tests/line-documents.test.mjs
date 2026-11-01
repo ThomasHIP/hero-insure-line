@@ -102,3 +102,39 @@ assert.equal(await env.DOCUMENTS.get(`${latestState.caseId}/files/latest-a.jpg.o
 assert.ok(await env.DOCUMENTS.get(`${latestState.caseId}/files/latest-b.jpg.ocr.json`));
 console.log('PASS: English latest-only command, older image excluded, actionable quick replies.');
 
+
+assert.match(replies.at(-1).messages[0].text, /ทะเบียน: ทดสอบ 1234/, 'return OCR fields in LINE');
+const beforeReuse = ocrCalls;
+await event({type:'text',id:'reuse-latest',text:'อ่านเฉพาะเอกสารล่าสุด'},'latest-user');
+assert.equal(ocrCalls,beforeReuse,'reuse saved OCR without charging again');
+await event({type:'text',id:'edit-latest',text:'แก้ไข\nทะเบียน: กข 5678\nจังหวัด: กรุงเทพมหานคร'},'latest-user');
+assert.match(replies.at(-1).messages[0].text,/ทะเบียน: กข 5678/);
+const customerKey = latestState.caseId + '/files/latest-b.jpg.customer.json';
+let customer = await (await env.DOCUMENTS.get(customerKey)).json();
+assert.equal(customer.fields.registration_number,'กข 5678');
+assert.equal(customer.status,'EDITED');
+await event({type:'text',id:'confirm-latest',text:'ยืนยันข้อมูล'},'latest-user');
+customer = await (await env.DOCUMENTS.get(customerKey)).json();
+assert.equal(customer.status,'CUSTOMER_CONFIRMED');
+assert.equal((await (await env.DOCUMENTS.get(latestState.caseId + '/files/latest-b.jpg.ocr.json')).json()).fields.registration_number,'ทดสอบ 1234','retain original OCR');
+await event({type:'text',id:'wrong-user-confirm',text:'ยืนยันข้อมูล'},'another-user');
+assert.match(replies.at(-1).messages[0].text,/กรุณากด/);
+await event({type:'text',id:'invalid-edit',text:'แก้ไข\nเลขบัตร: 1234'},'latest-user');
+assert.match(replies.at(-1).messages[0].text,/ยังไม่ได้บันทึก/);
+assert.equal((await (await env.DOCUMENTS.get(customerKey)).json()).status,'CUSTOMER_CONFIRMED');
+console.log('PASS: LINE OCR result, saved result reuse, corrections, confirmation, original retained, user isolation, invalid edits rejected.');
+
+const afterReview = await worker.fetch(new Request('https://worker.test/admin?key=test-admin'),env,ctx);
+const reviewedMarkup = await afterReview.text();
+assert.ok(reviewedMarkup.includes('กข 5678'));
+assert.ok(reviewedMarkup.includes('CUSTOMER_CONFIRMED'));
+await event({type:'image',id:'auto-next'},'latest-user');
+assert.match(replies.at(-1).messages[0].text,/ผลอ่านเอกสาร/,'consented uploads return OCR text automatically');
+const workingFetch = globalThis.fetch;
+globalThis.fetch = async (url, options) => String(url).includes('hero-insure-read-document') ? Response.json({error:'OCR_PROVIDER_FAILED'}, {status:503}) : workingFetch(url, options);
+await event({type:'image',id:'ocr-failure'},'failure-user');
+await event({type:'text',id:'read-failure',text:'อ่านเฉพาะเอกสารล่าสุด'},'failure-user');
+assert.match(replies.at(-1).messages[0].text,/ยังอ่านข้อมูลไม่ได้/);
+assert.ok(!replies.at(-1).messages[0].text.includes('OCR_PROVIDER_FAILED'));
+globalThis.fetch = workingFetch;
+console.log('PASS: admin sees customer corrections, consented uploads return text, provider failure shown clearly.');
