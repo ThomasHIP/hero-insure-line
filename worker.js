@@ -53,7 +53,13 @@ async function handleWebhook(request, env) {
     const payload = JSON.parse(rawBody);
     const events = Array.isArray(payload.events) ? payload.events : [];
 
-    await Promise.allSettled(events.map((event) => processEvent(event, env)));
+    const results = await Promise.allSettled(events.map((event) => processEvent(event, env)));
+    for (const result of results) {
+      if (result.status === "rejected") {
+        const match = String(result.reason).match(/LINE reply failed: (\d{3})/);
+        console.error("LINE event processing failed", { stage: match ? "REPLY" : "CASE_PROCESSING", status: match ? Number(match[1]) : null });
+      }
+    }
     return json({ success: true, processed: events.length });
   } catch (error) {
     console.error("Webhook error", error);
@@ -237,7 +243,12 @@ async function handleDocumentMessage(event, env, userId, state) {
         headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }
       });
       if (!response.ok) {
-        console.error("LINE document download failed", { status: response.status });
+        const detail = await response.text();
+        const reason = /channel/i.test(detail) ? "CHANNEL_MISMATCH"
+          : /token|authentication|authorization/i.test(detail) ? "ACCESS_TOKEN_REJECTED"
+          : /message|content|not found/i.test(detail) ? "MESSAGE_CONTENT_UNAVAILABLE"
+          : "UNCLASSIFIED";
+        console.error("LINE document download failed", { status: response.status, reason });
       } else {
         const contentType = response.headers.get("content-type") || "application/octet-stream";
         const extension = extensionFromContentType(contentType);
