@@ -205,13 +205,17 @@ async function processEvent(event, env) {
     return;
   }
 
-  if (["ยินยอมอ่านเอกสาร", "consent ocr"].includes(text)) {
+  if (["ยินยอมอ่านเอกสาร", "consent ocr", "read only latest doc.", "read only latest doc", "read latest document", "อ่านเฉพาะเอกสารล่าสุด"].includes(text)) {
     const record = state?.caseId ? await loadCase(env, state.caseId) : null;
     if (!record) { await reply(event.replyToken, "กรุณาส่งเอกสารก่อน", env.LINE_CHANNEL_ACCESS_TOKEN); return; }
+    const latestOnly = !["ยินยอมอ่านเอกสาร", "consent ocr"].includes(text);
+    const storedDocs = record.documents.filter(d => d.storage === "R2");
+    if (!storedDocs.length) { await reply(event.replyToken, "ยังไม่มีเอกสารที่บันทึกสำเร็จ กรุณาส่งภาพเอกสารก่อน", env.LINE_CHANNEL_ACCESS_TOKEN); return; }
+    record.ocrDocumentId = latestOnly ? storedDocs[storedDocs.length - 1].id : null;
     record.ocrConsentAt = nowIso();
     record.timeline.push(eventLog("OCR_CONSENT_GRANTED"));
     await saveCase(env, record);
-    await reply(event.replyToken, "รับความยินยอมแล้ว ระบบจะส่งภาพให้ OpenAI อ่านข้อมูลเพื่อให้เจ้าหน้าที่ตรวจสอบกับต้นฉบับ", env.LINE_CHANNEL_ACCESS_TOKEN);
+    await reply(event.replyToken, "รับความยินยอมแล้ว ระบบจะส่งภาพที่เลือกให้ OpenAI อ่านข้อมูลเพื่อให้เจ้าหน้าที่ตรวจสอบกับต้นฉบับ", env.LINE_CHANNEL_ACCESS_TOKEN);
     scheduleOcr(env, record.caseId);
     return;
   }
@@ -664,7 +668,7 @@ async function reply(replyToken, text, token) {
   const response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ replyToken, messages: [{ type: "text", text }] })
+    body: JSON.stringify({ replyToken, messages: [{ type: "text", text, quickReply: { items: [ ["ยินยอมอ่านล่าสุด", "อ่านเฉพาะเอกสารล่าสุด"], ["ยินยอมอ่านทุกภาพ", "ยินยอมอ่านเอกสาร"], ["ส่งเอกสารครบแล้ว", "ส่งเอกสารครบแล้ว"], ["เมนูหลัก", "เมนู"] ].map(([label, command]) => ({ type: "action", action: { type: "message", label, text: command } })) } }] })
   });
   if (!response.ok) throw new Error(`LINE reply failed: ${response.status}`);
 }
@@ -758,7 +762,7 @@ function scheduleOcr(env, caseId) {
 async function runCaseOcr(env, caseId) {
   const record = await loadCase(env, caseId);
   if (!record?.ocrConsentAt || !env.DOCUMENTS) return;
-  const pending = record.documents.filter(d => d.storage === "R2" && !d.ocr).slice(0, 4);
+  const pending = record.documents.filter(d => d.storage === "R2" && !d.ocr && (!record.ocrDocumentId || d.id === record.ocrDocumentId)).slice(0, 4);
   await Promise.all(pending.map(document => extractDocument(env, document)));
 }
 
