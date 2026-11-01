@@ -227,36 +227,43 @@ async function handleDocumentMessage(event, env, userId, state) {
     r2Key: null
   };
 
-  if (env.DOCUMENTS && event.message.id) {
+  if (!env.DOCUMENTS) {
+    console.error("Document storage unavailable: DOCUMENTS R2 binding missing");
+  } else if (!event.message.id) {
+    console.error("Document storage unavailable: LINE message ID missing");
+  } else {
     try {
       const response = await fetch(`https://api-data.line.me/v2/bot/message/${event.message.id}/content`, {
         headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }
       });
-      if (response.ok) {
+      if (!response.ok) {
+        console.error("LINE document download failed", { status: response.status });
+      } else {
         const contentType = response.headers.get("content-type") || "application/octet-stream";
         const extension = extensionFromContentType(contentType);
         const key = `${caseRecord.caseId}/${Date.now()}-${documentNumber}.${extension}`;
-        await env.DOCUMENTS.put(key, response.body, { httpMetadata: { contentType } });
+        const stored = await env.DOCUMENTS.put(key, response.body, { httpMetadata: { contentType } });
+        if (!stored) throw new Error("R2 put returned no object");
         document.storage = "R2";
         document.r2Key = key;
         document.contentType = contentType;
       }
     } catch (error) {
-      console.error("Document storage error", error);
+      console.error("Document storage error", String(error));
     }
   }
 
   caseRecord.documents.push(document);
   caseRecord.status = "DOCUMENTS_RECEIVING";
   caseRecord.updatedAt = nowIso();
-  caseRecord.timeline.push(eventLog("DOCUMENT_RECEIVED", { documentId: document.id, count: caseRecord.documents.length }));
+  caseRecord.timeline.push(eventLog(document.storage === "R2" ? "DOCUMENT_STORED" : "DOCUMENT_STORAGE_FAILED", { documentId: document.id, count: caseRecord.documents.length }));
   await saveCase(env, caseRecord);
   await setUserState(env, userId, { mode: "WAITING_DOCUMENTS", caseId: caseRecord.caseId, product: caseRecord.product });
 
   await reply(
     event.replyToken,
     [
-      "✅ รับเอกสารแล้ว",
+      document.storage === "R2" ? "✅ รับเอกสารและบันทึกอย่างปลอดภัยแล้ว" : "⚠️ ได้รับข้อความเอกสาร แต่ยังบันทึกไฟล์ไม่สำเร็จ กรุณาติดต่อเจ้าหน้าที่",
       "",
       `หมายเลขเคส: ${caseRecord.caseId}`,
       `จำนวนเอกสาร: ${caseRecord.documents.length} รายการ`,
