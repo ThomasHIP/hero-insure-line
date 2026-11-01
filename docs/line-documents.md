@@ -2,10 +2,10 @@
 
 Production webhook stays at https://hero-insure.pages.dev/api/line/webhook and forwards the original body/signature to the document Worker.
 
-## Required production secrets
+## Production secrets
 
 - LINE_CHANNEL_SECRET: actual channel secret for channel 2008306643 (not the channel ID).
-- LINE_CHANNEL_ACCESS_TOKEN: Messaging API channel access token for the same OA, basic ID @557cxljs.
+- LINE_CHANNEL_ACCESS_TOKEN: legacy value; no longer used. The Worker issues 15-minute stateless tokens for channel 2008306643 from LINE_CHANNEL_SECRET, caches them privately in memory, and renews before expiry. No copied access token or Developers Console login is required.
 - ADMIN_DASHBOARD_KEY: private, unpredictable administrator password. Set through Cloudflare secrets; never commit it.
 
 GET /health reports only binding presence, administrator setup, and public LINE bot identity. It never returns credentials or customer data. Results are cached for 60 seconds.

@@ -12,7 +12,7 @@ export default {
       return json({
         success: true,
         service: "HERO Insure LINE Case System",
-        version: "line-documents-review-v3",
+        version: "line-auto-token-v4",
         bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) },
         status: "running",
         webhook: `${url.origin}/webhook`,
@@ -59,6 +59,7 @@ async function handleWebhook(request, env) {
 
     const payload = JSON.parse(rawBody);
     const events = Array.isArray(payload.events) ? payload.events : [];
+    if (events.length) env = { ...env, LINE_CHANNEL_ACCESS_TOKEN: await getLineToken(env) };
 
     const results = [];
     for (const event of events) {
@@ -619,7 +620,7 @@ async function listAllVouchers(env) {
 }
 
 function ensureKv(env) { if (!env.CASES) throw new Error("Cloudflare KV binding CASES is missing"); }
-function requireLineSecrets(env) { if (!env.LINE_CHANNEL_SECRET || !env.LINE_CHANNEL_ACCESS_TOKEN) throw new Error("LINE secrets missing"); }
+function requireLineSecrets(env) { if (!env.LINE_CHANNEL_SECRET) throw new Error("LINE channel secret missing"); }
 function normalizeVoucher(value) { return value.trim().toUpperCase().replace(/^VOUCHER\s+/, "").replace(/\s+/g, ""); }
 function generateCaseId() { const d = new Date(); const date = `${d.getUTCFullYear()}${String(d.getUTCMonth()+1).padStart(2,"0")}${String(d.getUTCDate()).padStart(2,"0")}`; return `HI-${date}-${crypto.randomUUID().slice(0,6).toUpperCase()}`; }
 function eventLog(type, details = {}) { return { type, at: nowIso(), ...details }; }
@@ -658,15 +659,15 @@ async function health(env) {
   let line = { tokenAccepted: false, accountMatches: false };
   try {
     const response = await fetch("https://api.line.me/v2/bot/info", {
-      headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN || ""}` },
+      headers: { Authorization: `Bearer ${await getLineToken(env)}` },
       signal: AbortSignal.timeout(8000)
     });
     if (response.ok) {
       const info = await response.json();
       line = { tokenAccepted: true, accountMatches: info.basicId === "@557cxljs", basicId: info.basicId };
     }
-  } catch {}
-  const data = { bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) }, adminConfigured: Boolean(env.ADMIN_DASHBOARD_KEY), line };
+  } catch (error) { line.reason = /^LINE_TOKEN_[A-Z_]+$/.test(error.message || "") ? error.message : "LINE_CONNECTION_FAILED"; }
+  const data = { signatureSecretConfigured: Boolean(env.LINE_CHANNEL_SECRET), bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) }, adminConfigured: Boolean(env.ADMIN_DASHBOARD_KEY), line };
   healthCache = { data, until: Date.now() + 60000 };
   return json(data);
 }
@@ -834,4 +835,30 @@ function documentReviewHtml(record, key, origin) {
       ${record.ocrConsentAt && document.storage === "R2" ? `<form method="post" action="${origin}/admin/ocr/${encodeURIComponent(record.caseId)}?key=${encodeURIComponent(key)}"><input type="hidden" name="documentId" value="${escapeHtml(document.id)}"><button>Read / retry OCR</button></form>` : ""}
       </details>`;
   }).join("");
+}
+
+const LINE_CHANNEL_ID = "2008306643";
+let lineTokenCache;
+let lineTokenPending;
+
+async function getLineToken(env) {
+  const secret = env.LINE_CHANNEL_SECRET;
+  if (!secret) throw new Error("LINE_TOKEN_SECRET_MISSING");
+  if (lineTokenCache?.secret === secret && lineTokenCache.expiresAt > Date.now()) return lineTokenCache.token;
+  if (lineTokenPending?.secret === secret) return lineTokenPending.promise;
+  const promise = (async () => {
+    const response = await fetch("https://api.line.me/oauth2/v3/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "client_credentials", client_id: LINE_CHANNEL_ID, client_secret: secret }),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!response.ok) throw new Error(response.status === 400 || response.status === 401 ? "LINE_TOKEN_SECRET_REJECTED" : "LINE_TOKEN_SERVICE_UNAVAILABLE");
+    const data = await response.json();
+    if (typeof data.access_token !== "string" || !Number.isFinite(data.expires_in) || data.expires_in < 60) throw new Error("LINE_TOKEN_INVALID_RESPONSE");
+    lineTokenCache = { secret, token: data.access_token, expiresAt: Date.now() + (data.expires_in - 60) * 1000 };
+    return data.access_token;
+  })();
+  lineTokenPending = { secret, promise };
+  try { return await promise; } finally { if (lineTokenPending?.promise === promise) lineTokenPending = null; }
 }

@@ -15,8 +15,15 @@ class R2 {
   async head(key) { const value=this.values.get(key);return value?{size:value.bytes.length}:null; }
   async list({prefix}) { return {objects:[...this.values.keys()].filter(k=>k.startsWith(prefix)).map(key=>({key})),truncated:false}; }
 }
+let tokenIssues = 0;
 let downloadStatus = 200; const replies=[]; let downloads=0; let ocrCalls=0;
 globalThis.fetch = async (url,options={}) => {
+  if(String(url).endsWith('/oauth2/v3/token')) {
+    tokenIssues++;
+    assert.equal(options.body.get('client_id'),'2008306643');
+    assert.equal(options.body.get('client_secret'),'test-secret');
+    return Response.json({access_token:'test-token',expires_in:899,token_type:'Bearer'});
+  }
   if(String(url).includes('api-data.line.me')) { downloads++; assert.match(options.headers.Authorization,/Bearer test-token/); return new Response(downloadStatus===200?new Uint8Array([255,216,255,1,2,3]):'Bad channel',{status:downloadStatus,headers:{'content-type':'image/jpeg'}}); }
   if(String(url).includes('/message/reply')) {replies.push(JSON.parse(options.body));return new Response('{}');}
   if(String(url).includes('hero-insure-read-document')) {ocrCalls++;assert.equal(options.body.get('consent'),'yes');return Response.json({document_type:'registration_book',fields:{registration_number:'ทดสอบ 1234',owner_name:'<script>alert(1)</script>',citizen_id:'must not persist'},warnings:['ต้องตรวจสอบกับต้นฉบับ']});}
@@ -65,4 +72,18 @@ await event({type:'text',id:'done-2',text:'ส่งเอกสารครบ�
 assert.match(replies.at(-1).messages[0].text,/ยังมีไฟล์ที่บันทึกไม่สำเร็จ/);
 downloadStatus=200;env.DOCUMENTS.fail=true;
 const failedStore=await event({type:'image',id:'failed-r2'},'user-3');assert.equal(failedStore.status,503);
-console.log('PASS: signatures; image download; verified storage; fast uploads under KV throttling; duplicate delivery; consent; Thai OCR fields; private file access; admin correction; XSS escaping; failed-download reporting; failed-storage retry status.');
+assert.equal(tokenIssues,1,'reuse token across uploads without exposing or repeatedly issuing credentials');
+const realNow = Date.now;
+Date.now = () => realNow() + 16 * 60 * 1000;
+env.DOCUMENTS.fail = false;
+await event({type:'text',id:'expiry-check',text:'4'});
+assert.equal(tokenIssues,2,'renew expired tokens automatically');
+Date.now = realNow;
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (url,options) => String(url).endsWith('/oauth2/v3/token') ? Response.json({error:'invalid_client'},{status:400}) : originalFetch(url,options);
+const isolated = await import('../worker.js?token-rejection-test');
+const rejected = await (await isolated.default.fetch(new Request('https://worker.test/health'),{...env,LINE_CHANNEL_SECRET:'invalid-test-secret'},ctx)).json();
+assert.equal(rejected.line.reason,'LINE_TOKEN_SECRET_REJECTED');
+assert.ok(!JSON.stringify(rejected).includes('invalid-test-secret'));
+globalThis.fetch = originalFetch;
+console.log('PASS: token renewal; rejected-secret privacy; signatures; image download; verified storage; fast uploads under KV throttling; duplicate delivery; consent; Thai OCR fields; private file access; admin correction; XSS escaping; failed-download reporting; failed-storage retry status.');
