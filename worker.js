@@ -694,7 +694,7 @@ async function health(env) {
   } catch (error) { line.reason = /^LINE_TOKEN_[A-Z_]+$/.test(error.message || "") ? error.message : "LINE_CONNECTION_FAILED"; }
   const data = { signatureSecretConfigured: Boolean(env.LINE_CHANNEL_SECRET), bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) }, adminConfigured: Boolean(env.ADMIN_DASHBOARD_KEY), line };
   healthCache = { data, until: Date.now() + 60000 };
-  return json({ ...data, processing: await readProcessingTrace(env) });
+  return json({ ...data, processing: await readProcessingTrace(env), storageTest: await readStorageTest(env) });
 }
 
 
@@ -978,6 +978,6 @@ async function verifyR2Storage(env) {
   await env.DOCUMENTS.put("_health/storage-check.json", JSON.stringify(result), { httpMetadata: { contentType: "application/json" } });
 }
 async function readStorageTest(env) {
-  try { const object = await env.DOCUMENTS?.get("_health/storage-check.json"); return object ? await object.json() : null; }
+  try { let object = await env.DOCUMENTS?.get("_health/storage-check.json"); if (!object && env.DOCUMENTS) { await verifyR2Storage(env); object = await env.DOCUMENTS.get("_health/storage-check.json"); } return object ? await object.json() : null; }
   catch { return null; }
 }
