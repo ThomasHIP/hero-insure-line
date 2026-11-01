@@ -12,7 +12,7 @@ export default {
       return json({
         success: true,
         service: "HERO Insure LINE Case System",
-        version: "line-auto-token-v4",
+        version: "line-upload-diagnostics-v5",
         bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) },
         status: "running",
         webhook: `${url.origin}/webhook`,
@@ -59,12 +59,12 @@ async function handleWebhook(request, env) {
 
     const payload = JSON.parse(rawBody);
     const events = Array.isArray(payload.events) ? payload.events : [];
-    if (events.length) env = { ...env, LINE_CHANNEL_ACCESS_TOKEN: await getLineToken(env) };
+    if (events.length) env = { ...env, PROCESSING_TRACE: { receivedAt: nowIso(), stage: "TOKEN" }, LINE_CHANNEL_ACCESS_TOKEN: await getLineToken(env) };
 
     const results = [];
     for (const event of events) {
       try { await processEvent(event, env); results.push({ status: "fulfilled" }); }
-      catch (reason) { results.push({ status: "rejected", reason }); }
+      catch (reason) { if (env.PROCESSING_TRACE) { env.PROCESSING_TRACE.failedStage = env.PROCESSING_TRACE.stage; env.PROCESSING_TRACE.error = safeError(reason); env.PROCESSING_TRACE.stage = "FAILED"; } results.push({ status: "rejected", reason }); }
     }
     for (const result of results) {
       if (result.status === "rejected") {
@@ -72,6 +72,7 @@ async function handleWebhook(request, env) {
         console.error("LINE event processing failed", { stage: match ? "REPLY" : "CASE_PROCESSING", reason: /binding CASES is missing/.test(String(result.reason)) ? "CASES_BINDING_MISSING" : /429|rate.limit|too many/i.test(String(result.reason)) ? "STORAGE_RATE_LIMIT" : "UNCLASSIFIED", status: match ? Number(match[1]) : null });
       }
     }
+    if (events.length) await persistProcessingTrace(env);
     const failed = results.filter(r => r.status === "rejected").length;
     return json({ success: failed === 0, processed: events.length - failed, failed }, failed ? 503 : 200);
   } catch (error) {
@@ -91,6 +92,7 @@ async function processEvent(event, env) {
 
   if (event.type !== "message") return;
 
+  traceStage(env, "USER_STATE");
   const state = await getUserState(env, userId);
 
   if (event.message?.type === "image" || event.message?.type === "file") {
@@ -270,8 +272,9 @@ async function handleDocumentMessage(event, env, userId, state) {
     console.error("Document storage unavailable: LINE message ID missing");
   } else {
     try {
+      traceStage(env, "LINE_DOWNLOAD");
       const response = await fetch(`https://api-data.line.me/v2/bot/message/${event.message.id}/content`, {
-        headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }
+        headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }, signal: AbortSignal.timeout(15000)
       });
       if (!response.ok) {
         const detail = await response.text();
@@ -279,12 +282,15 @@ async function handleDocumentMessage(event, env, userId, state) {
           : /token|authentication|authorization/i.test(detail) ? "ACCESS_TOKEN_REJECTED"
           : /message|content|not found/i.test(detail) ? "MESSAGE_CONTENT_UNAVAILABLE"
           : "UNCLASSIFIED";
+        traceStage(env, "DOWNLOAD_FAILED", { error: reason, downloadStatus: response.status });
         console.error("LINE document download failed", { status: response.status, reason });
       } else {
         const contentType = response.headers.get("content-type") || "application/octet-stream";
         const extension = extensionFromContentType(contentType);
         const key = `${caseRecord.caseId}/files/${encodeURIComponent(event.message.id)}.${extension}`;
-        const stored = await env.DOCUMENTS.put(key, response.body, { httpMetadata: { contentType } });
+        const bytes = await readDocumentBytes(response);
+        traceStage(env, "R2_PUT");
+        const stored = await env.DOCUMENTS.put(key, bytes, { httpMetadata: { contentType } });
         if (!stored) throw new Error("R2 put returned no object");
         document.storage = "R2";
         document.r2Key = key;
@@ -293,13 +299,16 @@ async function handleDocumentMessage(event, env, userId, state) {
         if (!check || check.size !== stored.size) throw new Error("R2_VERIFICATION_FAILED");
         document.size = check.size;
         document.verifiedAt = nowIso();
+        traceStage(env, "R2_VERIFIED");
       }
     } catch (error) {
+      traceStage(env, "STORAGE_FAILED", { error: safeError(error) });
       document.storage = "LINE_TEMPORARY"; document.r2Key = null;
       console.error("Document storage error", { reason: safeError(error) });
     }
   }
 
+  traceStage(env, "SAVE_CASE", { stored: document.storage === "R2" });
   caseRecord.documents = caseRecord.documents.filter(d => d.id !== document.id);
   caseRecord.documents.push(document);
   if (document.storage === "R2") await env.DOCUMENTS.put(`${caseRecord.caseId}/documents/${encodeURIComponent(document.id)}.json`, JSON.stringify(document), { httpMetadata: { contentType: "application/json" } });
@@ -311,6 +320,7 @@ async function handleDocumentMessage(event, env, userId, state) {
 
   if (document.storage === "R2" && caseRecord.ocrConsentAt) scheduleOcr(env, caseRecord.caseId);
 
+  traceStage(env, "REPLY", { stored: document.storage === "R2" });
   await reply(
     event.replyToken,
     [
@@ -325,6 +335,7 @@ async function handleDocumentMessage(event, env, userId, state) {
     ].join("\n"),
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
+  traceStage(env, document.storage === "R2" ? "STORED_AND_ACKNOWLEDGED" : "FAILED_AND_ACKNOWLEDGED");
 }
 
 async function handleVoucherCode(event, env, userId, rawCode) {
@@ -655,7 +666,7 @@ function html(content, status = 200) { return new Response(content, { status, he
 
 let healthCache;
 async function health(env) {
-  if (healthCache && healthCache.until > Date.now()) return json(healthCache.data);
+  if (healthCache && healthCache.until > Date.now()) return json({ ...healthCache.data, processing: await readProcessingTrace(env) });
   let line = { tokenAccepted: false, accountMatches: false };
   try {
     const response = await fetch("https://api.line.me/v2/bot/info", {
@@ -665,11 +676,13 @@ async function health(env) {
     if (response.ok) {
       const info = await response.json();
       line = { tokenAccepted: true, accountMatches: info.basicId === "@557cxljs", basicId: info.basicId };
+      const webhook = await fetch("https://api.line.me/v2/bot/channel/webhook/endpoint", { headers: { Authorization: `Bearer ${await getLineToken(env)}` }, signal: AbortSignal.timeout(8000) });
+      if (webhook.ok) { const settings = await webhook.json(); line.webhook = { active: settings.active, endpoint: settings.endpoint }; }
     }
   } catch (error) { line.reason = /^LINE_TOKEN_[A-Z_]+$/.test(error.message || "") ? error.message : "LINE_CONNECTION_FAILED"; }
   const data = { signatureSecretConfigured: Boolean(env.LINE_CHANNEL_SECRET), bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) }, adminConfigured: Boolean(env.ADMIN_DASHBOARD_KEY), line };
   healthCache = { data, until: Date.now() + 60000 };
-  return json(data);
+  return json({ ...data, processing: await readProcessingTrace(env) });
 }
 
 
@@ -861,4 +874,37 @@ async function getLineToken(env) {
   })();
   lineTokenPending = { secret, promise };
   try { return await promise; } finally { if (lineTokenPending?.promise === promise) lineTokenPending = null; }
+}
+
+function traceStage(env, stage, details = {}) {
+  if (env.PROCESSING_TRACE) Object.assign(env.PROCESSING_TRACE, { stage, updatedAt: nowIso() }, details);
+}
+async function persistProcessingTrace(env) {
+  if (!env.DOCUMENTS || !env.PROCESSING_TRACE) return;
+  try { await env.DOCUMENTS.put("_health/last-webhook.json", JSON.stringify(env.PROCESSING_TRACE), { httpMetadata: { contentType: "application/json" } }); }
+  catch { console.error("Processing trace persistence unavailable"); }
+}
+async function readProcessingTrace(env) {
+  try { const object = await env.DOCUMENTS?.get("_health/last-webhook.json"); return object ? await object.json() : null; }
+  catch { return { stage: "TRACE_UNAVAILABLE" }; }
+}
+async function readDocumentBytes(response) {
+  const limit = 20 * 1024 * 1024;
+  if (Number(response.headers.get("content-length") || 0) > limit) throw new Error("DOCUMENT_TOO_LARGE");
+  if (!response.body) throw new Error("DOCUMENT_BODY_MISSING");
+  const reader = response.body.getReader();
+  const chunks = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.byteLength;
+    if (length > limit) { await reader.cancel(); throw new Error("DOCUMENT_TOO_LARGE"); }
+    chunks.push(value);
+  }
+  if (!length) throw new Error("DOCUMENT_BODY_MISSING");
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes.buffer;
 }
