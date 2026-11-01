@@ -19,6 +19,8 @@ export default {
       });
     }
 
+    if (request.method === "GET" && url.pathname === "/health") return health(env);
+
     if (request.method === "POST" && url.pathname === "/webhook") {
       return handleWebhook(request, env);
     }
@@ -575,3 +577,22 @@ async function reply(replyToken, text, token) {
 function toBase64(buffer) { let binary = ""; for (const byte of new Uint8Array(buffer)) binary += String.fromCharCode(byte); return btoa(binary); }
 function json(data, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=UTF-8", "Cache-Control": "no-store" } }); }
 function html(content, status = 200) { return new Response(content, { status, headers: { "Content-Type": "text/html; charset=UTF-8", "Cache-Control": "no-store" } }); }
+
+let healthCache;
+async function health(env) {
+  if (healthCache && healthCache.until > Date.now()) return json(healthCache.data);
+  let line = { tokenAccepted: false, accountMatches: false };
+  try {
+    const response = await fetch("https://api.line.me/v2/bot/info", {
+      headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN || ""}` },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (response.ok) {
+      const info = await response.json();
+      line = { tokenAccepted: true, accountMatches: info.basicId === "@557cxljs" };
+    }
+  } catch {}
+  const data = { bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) }, adminConfigured: Boolean(env.ADMIN_DASHBOARD_KEY), line };
+  healthCache = { data, until: Date.now() + 60000 };
+  return json(data);
+}
