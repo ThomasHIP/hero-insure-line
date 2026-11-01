@@ -4,8 +4,9 @@
   "private": true,
   "description": "HERO Insure LINE Official Account webhook on Cloudflare Workers",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "dev": "wrangler dev --config wrangler.jsonc",
+    "deploy": "wrangler deploy --config wrangler.jsonc",
+    "test": "node --experimental-default-type=module tests/line-documents.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

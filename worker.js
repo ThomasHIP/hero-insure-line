@@ -4,14 +4,15 @@ const VOUCHER_PREFIX = "voucher:";
 const ADMIN_SESSION_TTL = 60 * 60 * 12;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    env = { ...env, TASK_CONTEXT: ctx };
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
       return json({
         success: true,
         service: "HERO Insure LINE Case System",
-        version: "storage-binding-check-v2",
+        version: "line-documents-review-v3",
         bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) },
         status: "running",
         webhook: `${url.origin}/webhook`,
@@ -24,6 +25,9 @@ export default {
     if (request.method === "POST" && url.pathname === "/webhook") {
       return handleWebhook(request, env);
     }
+
+    if (url.pathname.startsWith("/admin/document/")) return adminDocument(request, env, url);
+    if (url.pathname.startsWith("/admin/ocr/")) return adminOcr(request, env, url);
 
     if (url.pathname === "/admin") {
       return handleAdmin(request, env, url);
@@ -56,17 +60,22 @@ async function handleWebhook(request, env) {
     const payload = JSON.parse(rawBody);
     const events = Array.isArray(payload.events) ? payload.events : [];
 
-    const results = await Promise.allSettled(events.map((event) => processEvent(event, env)));
+    const results = [];
+    for (const event of events) {
+      try { await processEvent(event, env); results.push({ status: "fulfilled" }); }
+      catch (reason) { results.push({ status: "rejected", reason }); }
+    }
     for (const result of results) {
       if (result.status === "rejected") {
         const match = String(result.reason).match(/LINE reply failed: (\d{3})/);
         console.error("LINE event processing failed", { stage: match ? "REPLY" : "CASE_PROCESSING", reason: /binding CASES is missing/.test(String(result.reason)) ? "CASES_BINDING_MISSING" : /429|rate.limit|too many/i.test(String(result.reason)) ? "STORAGE_RATE_LIMIT" : "UNCLASSIFIED", status: match ? Number(match[1]) : null });
       }
     }
-    return json({ success: true, processed: events.length });
+    const failed = results.filter(r => r.status === "rejected").length;
+    return json({ success: failed === 0, processed: events.length - failed, failed }, failed ? 503 : 200);
   } catch (error) {
-    console.error("Webhook error", error);
-    return json({ success: false, error: String(error) }, 500);
+    console.error("Webhook error", { reason: safeError(error) });
+    return json({ success: false, error: "WEBHOOK_PROCESSING_FAILED" }, 500);
   }
 }
 
@@ -188,6 +197,17 @@ async function processEvent(event, env) {
     return;
   }
 
+  if (["ยินยอมอ่านเอกสาร", "consent ocr"].includes(text)) {
+    const record = state?.caseId ? await loadCase(env, state.caseId) : null;
+    if (!record) { await reply(event.replyToken, "กรุณาส่งเอกสารก่อน", env.LINE_CHANNEL_ACCESS_TOKEN); return; }
+    record.ocrConsentAt = nowIso();
+    record.timeline.push(eventLog("OCR_CONSENT_GRANTED"));
+    await saveCase(env, record);
+    await reply(event.replyToken, "รับความยินยอมแล้ว ระบบจะส่งภาพให้ OpenAI อ่านข้อมูลเพื่อให้เจ้าหน้าที่ตรวจสอบกับต้นฉบับ", env.LINE_CHANNEL_ACCESS_TOKEN);
+    scheduleOcr(env, record.caseId);
+    return;
+  }
+
   if (["ส่งเอกสารครบแล้ว", "documents complete", "done"].includes(text)) {
     if (!state?.caseId) {
       await reply(event.replyToken, "ยังไม่พบเคสเอกสาร กรุณาพิมพ์ 5 เพื่อเริ่มส่งเอกสาร", env.LINE_CHANNEL_ACCESS_TOKEN);
@@ -196,6 +216,10 @@ async function processEvent(event, env) {
     const caseRecord = await loadCase(env, state.caseId);
     if (!caseRecord) {
       await reply(event.replyToken, "ไม่พบข้อมูลเคส กรุณาพิมพ์ 5 เพื่อสร้างเคสใหม่", env.LINE_CHANNEL_ACCESS_TOKEN);
+      return;
+    }
+    if (!caseRecord.documents.length || caseRecord.documents.some(d => d.storage !== "R2")) {
+      await reply(event.replyToken, "ยังมีไฟล์ที่บันทึกไม่สำเร็จ กรุณาส่งไฟล์นั้นใหม่ก่อนส่งตรวจสอบ", env.LINE_CHANNEL_ACCESS_TOKEN);
       return;
     }
     caseRecord.status = "READY_FOR_REVIEW";
@@ -224,8 +248,11 @@ async function handleDocumentMessage(event, env, userId, state) {
   let caseRecord;
 
   if (state?.caseId) caseRecord = await loadCase(env, state.caseId);
-  if (!caseRecord) caseRecord = await getOrCreateOpenCase(env, userId, "DOCUMENT_ASSISTED", "LINE_DIRECT_DOCUMENT");
+  if (!caseRecord) caseRecord = await getOrCreateOpenCase(env, userId, "DOCUMENT_ASSISTED", "LINE_DIRECT_DOCUMENT", false);
 
+  if (["COMPLETED", "CANCELLED"].includes(caseRecord.status)) caseRecord = await getOrCreateOpenCase(env, userId, "DOCUMENT_ASSISTED", "LINE_DIRECT_DOCUMENT", false);
+  const previous = caseRecord.documents.find(d => d.id === event.message.id && d.storage === "R2");
+  if (previous) return; // LINE redelivery must not duplicate an already stored document.
   const documentNumber = caseRecord.documents.length + 1;
   const document = {
     id: event.message.id,
@@ -255,24 +282,33 @@ async function handleDocumentMessage(event, env, userId, state) {
       } else {
         const contentType = response.headers.get("content-type") || "application/octet-stream";
         const extension = extensionFromContentType(contentType);
-        const key = `${caseRecord.caseId}/${Date.now()}-${documentNumber}.${extension}`;
+        const key = `${caseRecord.caseId}/files/${encodeURIComponent(event.message.id)}.${extension}`;
         const stored = await env.DOCUMENTS.put(key, response.body, { httpMetadata: { contentType } });
         if (!stored) throw new Error("R2 put returned no object");
         document.storage = "R2";
         document.r2Key = key;
         document.contentType = contentType;
+        const check = await env.DOCUMENTS.head(key);
+        if (!check || check.size !== stored.size) throw new Error("R2_VERIFICATION_FAILED");
+        document.size = check.size;
+        document.verifiedAt = nowIso();
       }
     } catch (error) {
-      console.error("Document storage error", String(error));
+      document.storage = "LINE_TEMPORARY"; document.r2Key = null;
+      console.error("Document storage error", { reason: safeError(error) });
     }
   }
 
+  caseRecord.documents = caseRecord.documents.filter(d => d.id !== document.id);
   caseRecord.documents.push(document);
+  if (document.storage === "R2") await env.DOCUMENTS.put(`${caseRecord.caseId}/documents/${encodeURIComponent(document.id)}.json`, JSON.stringify(document), { httpMetadata: { contentType: "application/json" } });
   caseRecord.status = "DOCUMENTS_RECEIVING";
   caseRecord.updatedAt = nowIso();
   caseRecord.timeline.push(eventLog(document.storage === "R2" ? "DOCUMENT_STORED" : "DOCUMENT_STORAGE_FAILED", { documentId: document.id, count: caseRecord.documents.length }));
   await saveCase(env, caseRecord);
   await setUserState(env, userId, { mode: "WAITING_DOCUMENTS", caseId: caseRecord.caseId, product: caseRecord.product });
+
+  if (document.storage === "R2" && caseRecord.ocrConsentAt) scheduleOcr(env, caseRecord.caseId);
 
   await reply(
     event.replyToken,
@@ -282,6 +318,7 @@ async function handleDocumentMessage(event, env, userId, state) {
       `หมายเลขเคส: ${caseRecord.caseId}`,
       `จำนวนเอกสาร: ${caseRecord.documents.length} รายการ`,
       "",
+      caseRecord.ocrConsentAt ? "ระบบอ่านข้อมูลและรอเจ้าหน้าที่ตรวจสอบ" : "หากยินยอมส่งภาพให้ OpenAI อ่านข้อมูล พิมพ์: ยินยอมอ่านเอกสาร",
       "ส่งเอกสารเพิ่มเติมได้ต่อเนื่อง",
       "เมื่อครบแล้ว พิมพ์: ส่งเอกสารครบแล้ว"
     ].join("\n"),
@@ -315,7 +352,7 @@ async function handleVoucherCode(event, env, userId, rawCode) {
     return;
   }
 
-  const caseRecord = await getOrCreateOpenCase(env, userId, "VOUCHER_REDEMPTION", "LINE_MENU_3");
+  const caseRecord = await getOrCreateOpenCase(env, userId, "VOUCHER_REDEMPTION", "LINE_MENU_3", false);
   voucher.status = "RESERVED";
   voucher.reservedBy = userId;
   voucher.caseId = caseRecord.caseId;
@@ -421,6 +458,7 @@ function adminDashboard(cases, vouchers, key, origin) {
             <label>Note<textarea name="adminNote">${escapeHtml(item.adminNote || "")}</textarea></label>
             <button>Update case</button>
           </form>
+          ${documentReviewHtml(item, key, origin)}
           <p><strong>LINE User:</strong> ${escapeHtml(maskUserId(item.lineUserId))}</p>
           <p><strong>Created:</strong> ${escapeHtml(formatDate(item.createdAt))}</p>
         </details>
@@ -484,7 +522,7 @@ function productDocumentPrompt(caseRecord, productName) {
   ].join("\n");
 }
 
-async function getOrCreateOpenCase(env, userId, product, source) {
+async function getOrCreateOpenCase(env, userId, product, source, persist = true) {
   ensureKv(env);
   const state = await getUserState(env, userId);
   if (state?.caseId) {
@@ -492,7 +530,7 @@ async function getOrCreateOpenCase(env, userId, product, source) {
     if (existing && !["COMPLETED", "CANCELLED"].includes(existing.status)) {
       if (product !== "DOCUMENT_ASSISTED") existing.product = product;
       existing.updatedAt = nowIso();
-      await saveCase(env, existing);
+      if (persist) await saveCase(env, existing);
       return existing;
     }
   }
@@ -512,24 +550,60 @@ async function getOrCreateOpenCase(env, userId, product, source) {
     updatedAt: nowIso(),
     timeline: [eventLog("CASE_CREATED", { product, source })]
   };
-  await saveCase(env, caseRecord);
-  await setUserState(env, userId, { mode: "CASE_OPEN", caseId: caseRecord.caseId, product });
+  if (persist) await saveCase(env, caseRecord);
   return caseRecord;
 }
 
-async function loadCase(env, caseId) { ensureKv(env); return env.CASES.get(`${CASE_PREFIX}${caseId}`, "json"); }
-async function saveCase(env, caseRecord) { ensureKv(env); await env.CASES.put(`${CASE_PREFIX}${caseRecord.caseId}`, JSON.stringify(caseRecord)); }
-async function getUserState(env, userId) { ensureKv(env); return env.CASES.get(`${USER_PREFIX}${userId}`, "json"); }
-async function setUserState(env, userId, state) { ensureKv(env); await env.CASES.put(`${USER_PREFIX}${userId}`, JSON.stringify({ ...state, updatedAt: nowIso() })); }
+async function loadCase(env, caseId) {
+  ensureKv(env);
+  const stored = env.DOCUMENTS ? await env.DOCUMENTS.get(`case-index/${caseId}.json`) : null;
+  const record = stored ? await stored.json() : await env.CASES.get(`${CASE_PREFIX}${caseId}`, "json");
+  return record ? hydrateDocuments(env, record) : null;
+}
+async function saveCase(env, caseRecord) {
+  ensureKv(env);
+  const value = JSON.stringify(caseRecord);
+  if (env.DOCUMENTS) {
+    await env.DOCUMENTS.put(`case-index/${caseRecord.caseId}.json`, value, { httpMetadata: { contentType: "application/json" } });
+    try { await env.CASES.put(`${CASE_PREFIX}${caseRecord.caseId}`, value); }
+    catch (error) { console.warn("Case KV mirror delayed; private R2 record saved", { reason: safeError(error) }); }
+  } else await kvPut(env, `${CASE_PREFIX}${caseRecord.caseId}`, value);
+}
+async function getUserState(env, userId) {
+  ensureKv(env);
+  const stored = env.DOCUMENTS ? await env.DOCUMENTS.get(`user-state/${encodeURIComponent(userId)}.json`) : null;
+  return stored ? stored.json() : env.CASES.get(`${USER_PREFIX}${userId}`, "json");
+}
+async function setUserState(env, userId, state) {
+  ensureKv(env);
+  const value = JSON.stringify({ ...state, updatedAt: nowIso() });
+  if (env.DOCUMENTS) {
+    await env.DOCUMENTS.put(`user-state/${encodeURIComponent(userId)}.json`, value, { httpMetadata: { contentType: "application/json" } });
+    try { await env.CASES.put(`${USER_PREFIX}${userId}`, value); }
+    catch (error) { console.warn("User KV mirror delayed; private R2 state saved", { reason: safeError(error) }); }
+  } else await kvPut(env, `${USER_PREFIX}${userId}`, value);
+}
 async function clearTransientState(env, userId) { const current = await getUserState(env, userId); if (current?.caseId) await setUserState(env, userId, { mode: "MENU", caseId: current.caseId }); }
 async function loadVoucher(env, code) { ensureKv(env); return env.CASES.get(`${VOUCHER_PREFIX}${code}`, "json"); }
-async function saveVoucher(env, voucher) { ensureKv(env); await env.CASES.put(`${VOUCHER_PREFIX}${voucher.code}`, JSON.stringify(voucher)); }
+async function saveVoucher(env, voucher) { ensureKv(env); await kvPut(env, `${VOUCHER_PREFIX}${voucher.code}`, JSON.stringify(voucher)); }
 
 async function listAllCases(env) {
   ensureKv(env);
-  const listed = await env.CASES.list({ prefix: CASE_PREFIX, limit: 1000 });
-  const values = await Promise.all(listed.keys.map((key) => env.CASES.get(key.name, "json")));
-  return values.filter(Boolean);
+  const ids = new Set();
+  let cursor;
+  do {
+    const page = await env.CASES.list({ prefix: CASE_PREFIX, limit: 1000, ...(cursor ? { cursor } : {}) });
+    page.keys.forEach(key => ids.add(key.name.slice(CASE_PREFIX.length)));
+    cursor = page.list_complete === false ? page.cursor : undefined;
+  } while (cursor);
+  if (env.DOCUMENTS) {
+    do {
+      const page = await env.DOCUMENTS.list({ prefix: "case-index/", ...(cursor ? { cursor } : {}) });
+      page.objects.forEach(object => ids.add(object.key.slice("case-index/".length, -5)));
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  }
+  return (await Promise.all([...ids].map(caseId => loadCase(env, caseId)))).filter(Boolean);
 }
 
 async function listCasesForUser(env, userId) {
@@ -571,12 +645,12 @@ async function reply(replyToken, text, token) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ replyToken, messages: [{ type: "text", text }] })
   });
-  if (!response.ok) throw new Error(`LINE reply failed: ${response.status} ${await response.text()}`);
+  if (!response.ok) throw new Error(`LINE reply failed: ${response.status}`);
 }
 
 function toBase64(buffer) { let binary = ""; for (const byte of new Uint8Array(buffer)) binary += String.fromCharCode(byte); return btoa(binary); }
 function json(data, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=UTF-8", "Cache-Control": "no-store" } }); }
-function html(content, status = 200) { return new Response(content, { status, headers: { "Content-Type": "text/html; charset=UTF-8", "Cache-Control": "no-store" } }); }
+function html(content, status = 200) { return new Response(content, { status, headers: { "Content-Type": "text/html; charset=UTF-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" } }); }
 
 let healthCache;
 async function health(env) {
@@ -589,10 +663,175 @@ async function health(env) {
     });
     if (response.ok) {
       const info = await response.json();
-      line = { tokenAccepted: true, accountMatches: info.basicId === "@557cxljs" };
+      line = { tokenAccepted: true, accountMatches: info.basicId === "@557cxljs", basicId: info.basicId };
     }
   } catch {}
   const data = { bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) }, adminConfigured: Boolean(env.ADMIN_DASHBOARD_KEY), line };
   healthCache = { data, until: Date.now() + 60000 };
   return json(data);
+}
+
+
+const OCR_ENDPOINT = "https://xuygpfswpimhtvtmoljg.supabase.co/functions/v1/hero-insure-read-document";
+const OCR_CLIENT_KEY = "sb_publishable_bXiHN2U_vi3J3APNqfv14A_TXJ8tm1w"; // Existing public website client key; never a service-role credential.
+const OCR_FIELDS = ["registration_number", "province", "make", "model", "model_year", "color", "chassis_number", "engine_number", "engine_cc", "seats", "owner_name", "legal_owner", "insurer", "policy_number", "policy_start", "policy_expiry", "premium"];
+const ocrJobs = new Map();
+
+function safeError(error) {
+  const message = String(error);
+  if (/429|rate.limit|too many/i.test(message)) return "STORAGE_RATE_LIMIT";
+  if (/binding CASES is missing/.test(message)) return "CASES_BINDING_MISSING";
+  if (/R2_VERIFICATION_FAILED/.test(message)) return "R2_VERIFICATION_FAILED";
+  if (/timeout|abort/i.test(message)) return "UPSTREAM_TIMEOUT";
+  return "STORAGE_OR_UPSTREAM_FAILURE";
+}
+
+async function kvPut(env, key, value) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await env.CASES.put(key, value); }
+    catch (error) {
+      if (attempt >= 2 || !/429|rate.limit|too many/i.test(String(error))) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1100));
+    }
+  }
+}
+
+async function hydrateDocuments(env, record) {
+  if (!env.DOCUMENTS) return record;
+  const documents = new Map((record.documents || []).map(d => [d.id, d]));
+  let cursor;
+  do {
+    const page = await env.DOCUMENTS.list({ prefix: `${record.caseId}/documents/`, ...(cursor ? { cursor } : {}) });
+    for (const entry of page.objects) {
+      const object = await env.DOCUMENTS.get(entry.key);
+      if (!object) continue;
+      const document = await object.json();
+      documents.set(document.id, document);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  record.documents = await Promise.all([...documents.values()].map(async document => {
+    if (!document.r2Key) return document;
+    const ocr = await env.DOCUMENTS.get(`${document.r2Key}.ocr.json`);
+    if (ocr) document.ocr = await ocr.json();
+    const review = await env.DOCUMENTS.get(`${document.r2Key}.review.json`);
+    if (review) document.review = await review.json();
+    return document;
+  }));
+  return record;
+}
+
+function scheduleOcr(env, caseId) {
+  if (!env.TASK_CONTEXT?.waitUntil) return;
+  if (ocrJobs.has(caseId)) return;
+  const job = runCaseOcr(env, caseId).catch(error => console.error("OCR processing failed", { reason: safeError(error) })).finally(() => ocrJobs.delete(caseId));
+  ocrJobs.set(caseId, job);
+  env.TASK_CONTEXT.waitUntil(job);
+}
+
+async function runCaseOcr(env, caseId) {
+  const record = await loadCase(env, caseId);
+  if (!record?.ocrConsentAt || !env.DOCUMENTS) return;
+  const pending = record.documents.filter(d => d.storage === "R2" && !d.ocr).slice(0, 4);
+  await Promise.all(pending.map(document => extractDocument(env, document)));
+}
+
+async function extractDocument(env, document) {
+  const object = await env.DOCUMENTS.get(document.r2Key);
+  if (!object) throw new Error("R2_VERIFICATION_FAILED");
+  let result;
+  const contentType = document.contentType || object.httpMetadata?.contentType || "application/octet-stream";
+  if (!/^image\/(jpeg|png|webp)$/.test(contentType) || object.size > 5000000) {
+    result = { status: "MANUAL_REVIEW", reason: "IMAGE_FORMAT_OR_SIZE", needsReview: true };
+  } else {
+    const form = new FormData();
+    form.append("image", new Blob([await object.arrayBuffer()], { type: contentType }), "document." + extensionFromContentType(contentType));
+    form.append("consent", "yes");
+    form.append("type", "vehicle_document");
+    try {
+      const response = await fetch(OCR_ENDPOINT, {
+        method: "POST", headers: { apikey: OCR_CLIENT_KEY, Origin: "https://hero-insure.pages.dev" }, body: form,
+        signal: AbortSignal.timeout(20000)
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        const reason = /^[A-Z_]{1,80}$/.test(data.error || "") ? data.error : "OCR_PROVIDER_FAILED";
+        result = { status: "FAILED", reason, needsReview: true };
+      } else if (!data.fields || !["registration_book", "prb_policy", "voluntary_policy", "other"].includes(data.document_type)) {
+        result = { status: "FAILED", reason: "INVALID_OCR_RESULT", needsReview: true };
+      } else {
+        const fields = {};
+        for (const name of OCR_FIELDS) if (typeof data.fields[name] === "string") fields[name] = data.fields[name].slice(0, 300);
+        result = { status: "EXTRACTED", documentType: data.document_type, fields, warnings: (data.warnings || []).filter(x => typeof x === "string").slice(0, 12), needsReview: true };
+      }
+    } catch (error) { result = { status: "FAILED", reason: safeError(error), needsReview: true }; }
+  }
+  result.updatedAt = nowIso();
+  await env.DOCUMENTS.put(`${document.r2Key}.ocr.json`, JSON.stringify(result), { httpMetadata: { contentType: "application/json" } });
+  console.log("Document OCR finished", { status: result.status, reason: result.reason || null });
+  return result;
+}
+
+function adminAuthorized(request, env, url) {
+  const key = request.headers.get("x-admin-key") || url.searchParams.get("key");
+  return Boolean(env.ADMIN_DASHBOARD_KEY && key === env.ADMIN_DASHBOARD_KEY);
+}
+
+async function adminDocument(request, env, url) {
+  if (!adminAuthorized(request, env, url)) return json({ error: "Unauthorized" }, 401);
+  const parts = url.pathname.split("/");
+  const caseId = decodeURIComponent(parts[3] || "");
+  const documentId = decodeURIComponent(parts[4] || "");
+  const record = await loadCase(env, caseId);
+  const document = record?.documents.find(d => d.id === documentId && d.storage === "R2");
+  if (!document?.r2Key || !env.DOCUMENTS) return json({ error: "Document not found" }, 404);
+  if (request.method === "GET" && parts.length === 5) {
+    const object = await env.DOCUMENTS.get(document.r2Key);
+    if (!object) return json({ error: "Document not found" }, 404);
+    return new Response(object.body, { headers: {
+      "Content-Type": document.contentType || "application/octet-stream", "Cache-Control": "private, no-store",
+      "Content-Disposition": `attachment; filename="document.${extensionFromContentType(document.contentType || "")}"`,
+      "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; sandbox"
+    } });
+  }
+  if (request.method !== "POST" || parts[5] !== "review") return json({ error: "Method not allowed" }, 405);
+  if (request.headers.get("origin") && request.headers.get("origin") !== url.origin) return json({ error: "Origin denied" }, 403);
+  const form = await request.formData();
+  const status = String(form.get("reviewStatus") || "");
+  if (!["VERIFIED", "REJECTED", "PENDING"].includes(status)) return json({ error: "Invalid review status" }, 400);
+  const fields = {};
+  for (const name of OCR_FIELDS) fields[name] = String(form.get(name) || "").trim().slice(0, 300);
+  const review = { status, fields, note: String(form.get("reviewNote") || "").slice(0, 2000), reviewedAt: nowIso() };
+  await env.DOCUMENTS.put(`${document.r2Key}.review.json`, JSON.stringify(review), { httpMetadata: { contentType: "application/json" } });
+  return Response.redirect(`${url.origin}/admin?key=${encodeURIComponent(url.searchParams.get("key") || request.headers.get("x-admin-key") || "")}`, 303);
+}
+
+async function adminOcr(request, env, url) {
+  if (!adminAuthorized(request, env, url)) return json({ error: "Unauthorized" }, 401);
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (request.headers.get("origin") && request.headers.get("origin") !== url.origin) return json({ error: "Origin denied" }, 403);
+  const record = await loadCase(env, decodeURIComponent(url.pathname.split("/")[3] || ""));
+  if (!record) return json({ error: "Case not found" }, 404);
+  if (!record.ocrConsentAt) return json({ error: "CUSTOMER_OCR_CONSENT_REQUIRED" }, 409);
+  const form = await request.formData();
+  const document = record.documents.find(d => d.id === String(form.get("documentId")) && d.storage === "R2");
+  if (!document) return json({ error: "Document not found" }, 404);
+  const result = await extractDocument(env, document);
+  return json({ success: result.status === "EXTRACTED", ocr: result });
+}
+
+function documentReviewHtml(record, key, origin) {
+  return (record.documents || []).map(document => {
+    const base = `${origin}/admin/document/${encodeURIComponent(record.caseId)}/${encodeURIComponent(document.id)}?key=${encodeURIComponent(key)}`;
+    const fields = document.review?.fields || document.ocr?.fields || {};
+    return `<details><summary>Document: ${escapeHtml(document.fileName)} — ${escapeHtml(document.storage)} / OCR ${escapeHtml(document.ocr?.status || (record.ocrConsentAt ? "PENDING" : "AWAITING_CONSENT"))} / ${escapeHtml(document.review?.status || "PENDING")}</summary>
+      ${document.storage === "R2" ? `<a href="${escapeHtml(base)}" rel="noreferrer">Download private original</a>` : "Storage failed: ask customer to resend"}
+      <p>${escapeHtml(document.ocr?.reason || "")}</p><p>${escapeHtml((document.ocr?.warnings || []).join(" • "))}</p>
+      ${document.storage === "R2" ? `<form method="post" action="${origin}/admin/document/${encodeURIComponent(record.caseId)}/${encodeURIComponent(document.id)}/review?key=${encodeURIComponent(key)}">
+      ${OCR_FIELDS.map(name => `<label>${escapeHtml(name)}<input name="${name}" value="${escapeHtml(fields[name] || "")}"></label>`).join("")}
+      <label>Review<select name="reviewStatus">${["PENDING", "VERIFIED", "REJECTED"].map(s => `<option ${s === (document.review?.status || "PENDING") ? "selected" : ""}>${s}</option>`).join("")}</select></label>
+      <label>Review note<textarea name="reviewNote">${escapeHtml(document.review?.note || "")}</textarea></label><button>Save document verification</button></form>` : ""}
+      ${record.ocrConsentAt && document.storage === "R2" ? `<form method="post" action="${origin}/admin/ocr/${encodeURIComponent(record.caseId)}?key=${encodeURIComponent(key)}"><input type="hidden" name="documentId" value="${escapeHtml(document.id)}"><button>Read / retry OCR</button></form>` : ""}
+      </details>`;
+  }).join("");
 }
