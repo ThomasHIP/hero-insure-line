@@ -215,8 +215,24 @@ async function processEvent(event, env) {
     record.ocrConsentAt = nowIso();
     record.timeline.push(eventLog("OCR_CONSENT_GRANTED"));
     await saveCase(env, record);
-    await reply(event.replyToken, "รับความยินยอมแล้ว ระบบจะส่งภาพที่เลือกให้ OpenAI อ่านข้อมูลเพื่อให้เจ้าหน้าที่ตรวจสอบกับต้นฉบับ", env.LINE_CHANNEL_ACCESS_TOKEN);
-    scheduleOcr(env, record.caseId);
+    const selected = (latestOnly ? storedDocs.slice(-1) : storedDocs).slice(-4);
+    const results = await Promise.all(selected.map(async document => {
+      let result = document.ocr;
+      if (!result || result.status === "FAILED") {
+        try { result = await extractDocument(env, document); }
+        catch { result = { status: "FAILED" }; }
+      }
+      return { document, result };
+    }));
+    const editable = [...results].reverse().find(item => item.result?.status === "EXTRACTED");
+    await setUserState(env, userId, { ...state, mode: "OCR_REVIEW", caseId: record.caseId, ocrReviewDocumentId: editable?.document.id || null });
+    const summaries = results.map(({document, result}) => formatOcrText(record, document, result));
+    await reply(event.replyToken, summaries.join("\n\n────────\n\n").slice(0, 4900), env.LINE_CHANNEL_ACCESS_TOKEN);
+    return;
+  }
+
+  if (["ยืนยันข้อมูล", "confirm details", "confirm"].includes(text) || /^(แก้ไข|edit)(?:\s|$)/i.test(originalText)) {
+    await handleCustomerOcrReview(event, env, userId, state, originalText);
     return;
   }
 
@@ -329,7 +345,14 @@ async function handleDocumentMessage(event, env, userId, state) {
   await saveCase(env, caseRecord);
   await setUserState(env, userId, { mode: "WAITING_DOCUMENTS", caseId: caseRecord.caseId, product: caseRecord.product });
 
-  if (document.storage === "R2" && caseRecord.ocrConsentAt) scheduleOcr(env, caseRecord.caseId);
+  let customerOcrText = "";
+  if (document.storage === "R2" && caseRecord.ocrConsentAt) {
+    let result;
+    try { result = await extractDocument(env, document); }
+    catch { result = { status: "FAILED" }; }
+    if (result.status === "EXTRACTED") await setUserState(env, userId, { mode: "OCR_REVIEW", caseId: caseRecord.caseId, product: caseRecord.product, ocrReviewDocumentId: document.id });
+    customerOcrText = formatOcrText(caseRecord, document, result);
+  }
 
   traceStage(env, "REPLY", { stored: document.storage === "R2" });
   await persistProcessingTrace(env);
@@ -343,8 +366,9 @@ async function handleDocumentMessage(event, env, userId, state) {
       "",
       caseRecord.ocrConsentAt ? "ระบบอ่านข้อมูลและรอเจ้าหน้าที่ตรวจสอบ" : "หากยินยอมส่งภาพให้ OpenAI อ่านข้อมูล พิมพ์: ยินยอมอ่านเอกสาร",
       "ส่งเอกสารเพิ่มเติมได้ต่อเนื่อง",
-      "เมื่อครบแล้ว พิมพ์: ส่งเอกสารครบแล้ว"
-    ].join("\n"),
+      "เมื่อครบแล้ว พิมพ์: ส่งเอกสารครบแล้ว",
+      customerOcrText
+    ].join("\n").slice(0, 4900),
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
   traceStage(env, document.storage === "R2" ? "STORED_AND_ACKNOWLEDGED" : "FAILED_AND_ACKNOWLEDGED");
@@ -668,7 +692,7 @@ async function reply(replyToken, text, token) {
   const response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ replyToken, messages: [{ type: "text", text, quickReply: { items: [ ["ยินยอมอ่านล่าสุด", "อ่านเฉพาะเอกสารล่าสุด"], ["ยินยอมอ่านทุกภาพ", "ยินยอมอ่านเอกสาร"], ["ส่งเอกสารครบแล้ว", "ส่งเอกสารครบแล้ว"], ["เมนูหลัก", "เมนู"] ].map(([label, command]) => ({ type: "action", action: { type: "message", label, text: command } })) } }] })
+    body: JSON.stringify({ replyToken, messages: [{ type: "text", text, quickReply: { items: [ ["ยินยอมอ่านล่าสุด", "อ่านเฉพาะเอกสารล่าสุด"], ["ยินยอมอ่านทุกภาพ", "ยินยอมอ่านเอกสาร"], ["ส่งเอกสารครบแล้ว", "ส่งเอกสารครบแล้ว"], ["ยืนยันข้อมูล", "ยืนยันข้อมูล"], ["แก้ไขข้อมูล", "แก้ไข"], ["เมนูหลัก", "เมนู"] ].map(([label, command]) => ({ type: "action", action: { type: "message", label, text: command } })) } }] })
   });
   if (!response.ok) throw new Error(`LINE reply failed: ${response.status}`);
 }
@@ -746,6 +770,8 @@ async function hydrateDocuments(env, record) {
     if (ocr) document.ocr = await ocr.json();
     const review = await env.DOCUMENTS.get(`${document.r2Key}.review.json`);
     if (review) document.review = await review.json();
+    const customerReview = await env.DOCUMENTS.get(`${document.r2Key}.customer.json`);
+    if (customerReview) document.customerReview = await customerReview.json();
     return document;
   }));
   return record;
@@ -802,6 +828,69 @@ async function extractDocument(env, document) {
   return result;
 }
 
+
+const OCR_LABELS = {
+  registration_number: "ทะเบียน", province: "จังหวัด", make: "ยี่ห้อ", model: "รุ่น",
+  model_year: "ปีรถ", color: "สี", chassis_number: "เลขตัวถัง", engine_number: "เลขเครื่องยนต์",
+  engine_cc: "ซีซี", seats: "ที่นั่ง", owner_name: "ชื่อผู้ครอบครอง", legal_owner: "ชื่อเจ้าของ",
+  insurer: "บริษัทประกัน", policy_number: "เลขกรมธรรม์", policy_start: "วันเริ่มคุ้มครอง",
+  policy_expiry: "วันหมดอายุ", premium: "เบี้ยประกัน"
+};
+
+function formatOcrText(record, document, result, customerReview = document.customerReview) {
+  const heading = "📄 ผลอ่านเอกสาร • " + record.caseId + "\nไฟล์: " + document.fileName;
+  if (result?.status !== "EXTRACTED") return heading + "\n⚠️ ยังอ่านข้อมูลไม่ได้ กรุณาส่งภาพ JPG/PNG/WebP ที่ชัดเจน ขนาดไม่เกิน 5 MB หรือติดต่อเจ้าหน้าที่ พิมพ์ 5";
+  const fields = { ...result.fields, ...customerReview?.fields };
+  const rows = Object.entries(OCR_LABELS).filter(([key]) => fields[key]).map(([key, label]) => label + ": " + fields[key]);
+  return [heading, ...rows, rows.length ? "" : "ไม่พบข้อมูลที่อ่านได้ กรุณาส่งภาพให้ชัดขึ้น",
+    ...(result.warnings || []).slice(0, 3).map(warning => "⚠️ " + warning),
+    "", "ข้อมูลจาก OCR กรุณาตรวจสอบกับต้นฉบับ",
+    "ยืนยัน: พิมพ์ ยืนยันข้อมูล",
+    "แก้ไข: พิมพ์ แก้ไข แล้วระบุแต่ละบรรทัด เช่น",
+    "ทะเบียน: กข 1234\nจังหวัด: กรุงเทพมหานคร",
+    "การยืนยัน/แก้ไขใช้กับเอกสารล่าสุดที่อ่านสำเร็จ"].join("\n");
+}
+
+async function handleCustomerOcrReview(event, env, userId, state, originalText) {
+  const record = state?.caseId ? await loadCase(env, state.caseId) : null;
+  const document = record?.documents.find(d => d.id === state?.ocrReviewDocumentId);
+  if (!document || document.ocr?.status !== "EXTRACTED") {
+    await reply(event.replyToken, "กรุณากด ยินยอมอ่านล่าสุด เพื่ออ่านเอกสารก่อนยืนยันหรือแก้ไข", env.LINE_CHANNEL_ACCESS_TOKEN);
+    return;
+  }
+  const editing = /^(แก้ไข|edit)(?:\s|$)/i.test(originalText);
+  let customer = { ...document.customerReview, fields: { ...document.customerReview?.fields }, updatedAt: nowIso() };
+  if (editing) {
+    const input = originalText.replace(/^(แก้ไข|edit)\s*/i, "");
+    const lines = input.split(/\r?\n/).filter(line => line.trim());
+    const changes = {};
+    const invalid = [];
+    for (const line of lines) {
+      const match = line.match(/^\s*([^:=]+)\s*[:=]\s*(.+?)\s*$/);
+      const field = match && Object.keys(OCR_LABELS).find(key => key === match[1].trim().toLowerCase() || OCR_LABELS[key] === match[1].trim());
+      if (!field || match[2].length > 300) invalid.push(line);
+      else changes[field] = match[2];
+    }
+    if (!lines.length || invalid.length) {
+      await reply(event.replyToken, "พิมพ์แก้ไขในรูปแบบนี้:\nแก้ไข\nทะเบียน: กข 1234\nจังหวัด: กรุงเทพมหานคร\n\nช่องข้อมูลที่แก้ไขได้: " + Object.values(OCR_LABELS).join(", ") + "\nยังไม่ได้บันทึกการแก้ไข", env.LINE_CHANNEL_ACCESS_TOKEN);
+      return;
+    }
+    customer.fields = { ...customer.fields, ...changes };
+    customer.status = "EDITED";
+    delete customer.confirmedAt;
+  } else {
+    if (!Object.values({ ...document.ocr.fields, ...customer.fields }).some(Boolean)) {
+      await reply(event.replyToken, "ยังไม่มีข้อมูลให้อยืนยัน กรุณาส่งภาพที่ชัดเจนหรือแก้ไขข้อมูลก่อน", env.LINE_CHANNEL_ACCESS_TOKEN); return;
+    }
+    customer.status = "CUSTOMER_CONFIRMED";
+    customer.confirmedAt = nowIso();
+  }
+  await env.DOCUMENTS.put(document.r2Key + ".customer.json", JSON.stringify(customer), { httpMetadata: { contentType: "application/json" } });
+  await reply(event.replyToken, editing
+    ? "✏️ บันทึกการแก้ไขแล้ว\n" + formatOcrText(record, document, document.ocr, customer)
+    : "✅ ยืนยันข้อมูลเอกสารแล้ว\nหมายเลขเคส: " + record.caseId + "\nเจ้าหน้าที่ยังต้องตรวจสอบกับต้นฉบับก่อนดำเนินการ\nเมื่อส่งเอกสารครบ กด ส่งเอกสารครบแล้ว", env.LINE_CHANNEL_ACCESS_TOKEN);
+}
+
 function adminAuthorized(request, env, url) {
   const key = request.headers.get("x-admin-key") || url.searchParams.get("key");
   return Boolean(env.ADMIN_DASHBOARD_KEY && key === env.ADMIN_DASHBOARD_KEY);
@@ -853,10 +942,10 @@ async function adminOcr(request, env, url) {
 function documentReviewHtml(record, key, origin) {
   return (record.documents || []).map(document => {
     const base = `${origin}/admin/document/${encodeURIComponent(record.caseId)}/${encodeURIComponent(document.id)}?key=${encodeURIComponent(key)}`;
-    const fields = document.review?.fields || document.ocr?.fields || {};
+    const fields = { ...document.ocr?.fields, ...document.customerReview?.fields, ...document.review?.fields };
     return `<details><summary>Document: ${escapeHtml(document.fileName)} — ${escapeHtml(document.storage)} / OCR ${escapeHtml(document.ocr?.status || (record.ocrConsentAt ? "PENDING" : "AWAITING_CONSENT"))} / ${escapeHtml(document.review?.status || "PENDING")}</summary>
       ${document.storage === "R2" ? `<a href="${escapeHtml(base)}" rel="noreferrer">Download private original</a>` : "Storage failed: ask customer to resend"}
-      <p>${escapeHtml(document.ocr?.reason || "")}</p><p>${escapeHtml((document.ocr?.warnings || []).join(" • "))}</p>
+      <p>Customer confirmation: ${escapeHtml(document.customerReview?.status || "PENDING")}</p><p>${escapeHtml(document.ocr?.reason || "")}</p><p>${escapeHtml((document.ocr?.warnings || []).join(" • "))}</p>
       ${document.storage === "R2" ? `<form method="post" action="${origin}/admin/document/${encodeURIComponent(record.caseId)}/${encodeURIComponent(document.id)}/review?key=${encodeURIComponent(key)}">
       ${OCR_FIELDS.map(name => `<label>${escapeHtml(name)}<input name="${name}" value="${escapeHtml(fields[name] || "")}"></label>`).join("")}
       <label>Review<select name="reviewStatus">${["PENDING", "VERIFIED", "REJECTED"].map(s => `<option ${s === (document.review?.status || "PENDING") ? "selected" : ""}>${s}</option>`).join("")}</select></label>
