@@ -61,6 +61,7 @@ async function handleWebhook(request, env) {
     const events = Array.isArray(payload.events) ? payload.events : [];
     if (events.length) env = { ...env, PROCESSING_TRACE: { receivedAt: nowIso(), stage: "TOKEN" }, LINE_CHANNEL_ACCESS_TOKEN: await getLineToken(env) };
 
+    if (events.length) await persistProcessingTrace(env);
     const results = [];
     for (const event of events) {
       try { await processEvent(event, env); results.push({ status: "fulfilled" }); }
@@ -677,7 +678,10 @@ async function health(env) {
       const info = await response.json();
       line = { tokenAccepted: true, accountMatches: info.basicId === "@557cxljs", basicId: info.basicId };
       const webhook = await fetch("https://api.line.me/v2/bot/channel/webhook/endpoint", { headers: { Authorization: `Bearer ${await getLineToken(env)}` }, signal: AbortSignal.timeout(8000) });
-      if (webhook.ok) { const settings = await webhook.json(); line.webhook = { active: settings.active, endpoint: settings.endpoint }; }
+      if (webhook.ok) { const settings = await webhook.json(); line.webhook = { active: settings.active, endpoint: settings.endpoint };
+        const test = await fetch("https://api.line.me/v2/bot/channel/webhook/test", { method: "POST", headers: { Authorization: `Bearer ${await getLineToken(env)}`, "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(10000) });
+        if (test.ok) { const result = await test.json(); line.webhook.deliveryTest = { success: result.success, statusCode: result.statusCode, reason: result.reason }; }
+        else line.webhook.deliveryTest = { success: false, statusCode: test.status }; }
     }
   } catch (error) { line.reason = /^LINE_TOKEN_[A-Z_]+$/.test(error.message || "") ? error.message : "LINE_CONNECTION_FAILED"; }
   const data = { signatureSecretConfigured: Boolean(env.LINE_CHANNEL_SECRET), bindings: { cases: Boolean(env.CASES), documents: Boolean(env.DOCUMENTS) }, adminConfigured: Boolean(env.ADMIN_DASHBOARD_KEY), line };
