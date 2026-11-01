@@ -29,3 +29,18 @@ Existing KV keys are preserved. Private R2 holds strongly consistent case/user s
 Run npm test. Tests simulate signed LINE uploads, content download, R2 head verification, same-key KV throttling, duplicate webhook delivery, consent, Thai OCR fields, private file authorization, admin corrections, XSS, download errors, and storage errors. These mocked tests do not prove production LINE token configuration or an actual customer document round trip.
 
 A separate direct request to the existing production OCR service successfully extracted a synthetic registration image on 2026-11-01. Final production acceptance still requires a real LINE upload to return successful storage, its protected original to download, and OCR/admin review of that same document.
+
+
+## LINE OCR text and customer review
+
+The customer can select “ยินยอมอ่านล่าสุด” or send “Read only latest doc.” / “อ่านเฉพาะเอกสารล่าสุด”. The worker reads only the latest stored document and replies with extracted fields, warnings, and instructions for corrections or confirmation. Saved successful OCR is reused; failed extraction is retried. “ยินยอมอ่านเอกสาร” reads up to the four latest stored documents. New uploads after consent also return their OCR text in the upload reply. Failed or unsupported extraction returns an explicit customer message.
+
+Corrections use a message such as:
+
+แก้ไข
+ทะเบียน: กข 1234
+จังหวัด: กรุงเทพมหานคร
+
+Only named supported vehicle/policy fields are accepted. Invalid corrections are rejected without partial writes. The customer then sends “ยืนยันข้อมูล”. Editing and confirmation apply to the most recent successfully read document selected for review. The private .customer.json sidecar preserves customer changes separately from original .ocr.json output and staff .review.json verification. The protected admin dashboard shows customer corrections and confirmation status; customer confirmation never marks staff verification complete.
+
+The upload is first saved as a durable private R2 job before webhook acknowledgement. Background event processing handles the LINE reply; the existing worker cron retries pending jobs. A LINE reply token can expire on a delayed retry, so saved data and delivery confirmation remain separate outcomes. No customer data is exposed by public health diagnostics.
