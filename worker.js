@@ -113,7 +113,7 @@ async function handleCustomer(request, env, url) {
     if (!record) return json({error:"CASE_NOT_FOUND"},404);
     if (action === "session" && request.method === "GET") return json(customerView(record));
     if (request.method !== "POST") return json({error:"METHOD_NOT_ALLOWED"},405);
-    if (["COMPLETED","CANCELLED"].includes(record.status)) return json({error:"CASE_CLOSED"},409);
+    if (["COMPLETED","CANCELLED","READY_FOR_REVIEW"].includes(record.status)) return json({error:"CASE_CLOSED"},409);
     if (action === "upload") {
       if (Number(request.headers.get("content-length") || 0) > CUSTOMER_LIMIT + 100000) return json({error:"FILE_TOO_LARGE"},413);
       const form = await request.formData();
@@ -134,7 +134,7 @@ async function handleCustomer(request, env, url) {
       if (!check || check.size !== bytes.byteLength) throw Error("R2_VERIFICATION_FAILED");
       document.verifiedAt=nowIso();
       await env.DOCUMENTS.put(record.caseId+"/documents/"+encodeURIComponent(document.id)+".json",JSON.stringify(document),{httpMetadata:{contentType:"application/json"}});
-      record.documents.push(document);
+      record.documents=record.documents.filter(d=>d.intakeRole!==role);\n      record.documents.push(document);
       if (role === "POLICY") record.noPreviousPolicy=false;
       record.status="DOCUMENTS_RECEIVING"; record.updatedAt=nowIso();
       record.timeline.push(eventLog("WEB_DOCUMENT_STORED",{documentId:document.id,role}));
@@ -163,7 +163,7 @@ async function handleCustomer(request, env, url) {
         if (input.consent !== true) return json({error:"CONSENT_REQUIRED"},400);
         if (document.intakeRole === "IDENTITY") return json({error:"IDENTITY_MANUAL_REVIEW"},400);
         record.ocrConsentAt=nowIso(); await saveCase(env,record);
-        if (!document.ocr || document.ocr.status === "FAILED") document.ocr=await extractDocument(env,document);
+        if (!document.ocr || document.ocr.status === "FAILED") { document.ocr=await extractDocument(env,document); record.updatedAt=nowIso(); await saveCase(env,record); }
       } else {
         if (document.ocr?.status !== "EXTRACTED") return json({error:"OCR_REQUIRED"},409);
         const fields={};
@@ -173,7 +173,7 @@ async function handleCustomer(request, env, url) {
         }
         const customer={fields,status:input.confirmed === true?"CUSTOMER_CONFIRMED":"EDITED",updatedAt:nowIso(),...(input.confirmed === true?{confirmedAt:nowIso()}:{})};
         await env.DOCUMENTS.put(document.r2Key+".customer.json",JSON.stringify(customer),{httpMetadata:{contentType:"application/json"}});
-        document.customerReview=customer;
+        document.customerReview=customer;\n        record.updatedAt=nowIso(); await saveCase(env,record);
       }
       return json(customerView(record));
     }
@@ -184,7 +184,8 @@ async function handleCustomer(request, env, url) {
       record.postalContact.confirmedAt=nowIso(); record.status="READY_FOR_REVIEW"; record.updatedAt=nowIso();
       record.timeline.push(eventLog("WEB_CUSTOMER_INTAKE_CONFIRMED"));
       await saveCase(env,record);
-      return json(customerView(record));
+      const notification=await sendSubmissionNotifications(env,record);
+      return json({...customerView(record),notification});
     }
     return json({error:"NOT_FOUND"},404);
   } catch (error) {
@@ -193,6 +194,34 @@ async function handleCustomer(request, env, url) {
   }
 }
 
+async function sendSubmissionNotifications(env,record) {
+  const results={email:"NOT_CONFIGURED",line:"NOT_APPLICABLE"};
+  const email=record.postalContact?.email;
+  const label=({PRB:"ซื้อ พ.ร.บ.",VOLUNTARY:"ประกันรถยนต์",DOCUMENT_ASSISTED:"ส่งเอกสารประกันภัย"})[record.product]||"ประกันภัย";
+  if (email && env.RESEND_API_KEY && env.HERO_INSURE_FROM_EMAIL) {
+    try {
+      const response=await fetch("https://api.resend.com/emails",{
+        method:"POST",headers:{"Authorization":"Bearer "+env.RESEND_API_KEY,"Content-Type":"application/json","Idempotency-Key":"hero-insure-case-"+record.caseId},
+        body:JSON.stringify({from:env.HERO_INSURE_FROM_EMAIL,to:[email],subject:"HERO Insure ได้รับเอกสารของคุณแล้ว — "+record.caseId,
+          text:"HERO Insure ได้รับคำขอและเอกสารของคุณแล้ว\nหมายเลขเคส: "+record.caseId+"\nบริการ: "+label+"\nสถานะ: รอเจ้าหน้าที่ตรวจสอบ\n\nข้อความนี้เป็นการยืนยันรับคำขอ ไม่ใช่การอนุมัติหรือออกกรมธรรม์\nHERO Insure — Success Connection Co., Ltd."})
+      });
+      results.email=response.ok?"SENT":"FAILED_"+response.status;
+    } catch(e){results.email="FAILED";}
+  }
+  if (record.lineUserId && env.LINE_CHANNEL_ACCESS_TOKEN) {
+    try {
+      const response=await fetch("https://api.line.me/v2/bot/message/push",{
+        method:"POST",headers:{"Authorization":"Bearer "+env.LINE_CHANNEL_ACCESS_TOKEN,"Content-Type":"application/json"},
+        body:JSON.stringify({to:record.lineUserId,messages:[{type:"text",text:"✅ HERO Insure ได้รับเอกสารแล้ว\nหมายเลขเคส: "+record.caseId+"\nสถานะ: รอเจ้าหน้าที่ตรวจสอบ"}]})
+      });
+      results.line=response.ok?"SENT":"FAILED_"+response.status;
+    } catch(e){results.line="FAILED";}
+  }
+  record.notification=results;
+  record.timeline.push(eventLog("SUBMISSION_NOTIFICATIONS_ATTEMPTED",results));
+  await saveCase(env,record);
+  return results;
+}
 async function handleWebhook(request, env) {
   try {
     requireLineSecrets(env);
@@ -752,7 +781,7 @@ function mainMenu() {
     "2️⃣ ประกันภัยรถยนต์ภาคสมัครใจ",
     "3️⃣ แลกรับ Voucher / HERO Credits",
     "4️⃣ ตรวจสอบสถานะเคส",
-    "5️⃣ ส่งเอกสารผ่าน LINE / ติดต่อเจ้าหน้าที่",
+    "5️⃣ ส่งเอกสารผ่านเว็บไซต์ HERO Insure",
     "",
     "พิมพ์ตัวเลข 1–5 ได้ทันที"
   ].join("\n");
@@ -886,7 +915,7 @@ async function reply(replyToken, text, token) {
   const response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ replyToken, messages: [{ type: "text", text, quickReply: { items: [ ["ยินยอมอ่านล่าสุด", "อ่านเฉพาะเอกสารล่าสุด"], ["ยินยอมอ่านทุกภาพ", "ยินยอมอ่านเอกสาร"], ["ส่งเอกสารครบแล้ว", "ส่งเอกสารครบแล้ว"], ["ยืนยันข้อมูล", "ยืนยันข้อมูล"], ["แก้ไขข้อมูล", "แก้ไข"], ["ทะเบียนรถ", "ส่งทะเบียนรถ"], ["กรมธรรม์", "ส่งกรมธรรม์"], ["บัตร/ใบขับขี่", "ส่งบัตรหรือใบขับขี่"], ["ข้อมูลจัดส่ง", "ข้อมูลจัดส่ง"], ["ไม่มีกรมธรรม์เดิม", "ไม่มีกรมธรรม์เดิม"], ["ยืนยันส่งคำขอ", "ยืนยันส่งคำขอ"], ["เมนูหลัก", "เมนู"] ].map(([label, command]) => ({ type: "action", action: { type: "message", label, text: command } })) } }] })
+    body: JSON.stringify({ replyToken, messages: [{ type: "text", text, quickReply: { items: [ ["ซื้อ พ.ร.บ.", "1"], ["ประกันรถยนต์", "2"], ["ส่งเอกสาร", "5"], ["ตรวจสอบเคส", "4"], ["เมนูหลัก", "เมนู"] ].map(([label, command]) => ({ type: "action", action: { type: "message", label, text: command } })) } }] })
   });
   if (!response.ok) throw new Error(`LINE reply failed: ${response.status}`);
 }
