@@ -327,7 +327,7 @@ async function processEvent(event, env) {
   const state = await getUserState(env, userId);
 
   if (event.message?.type === "image" || event.message?.type === "file") {
-    await handleDocumentMessage(event, env, userId, state);
+    await reply(event.replyToken, "🔒 HERO Insure รับเอกสารผ่านเว็บไซต์เท่านั้น เพื่อความปลอดภัยและให้ตรวจสอบแก้ไขข้อมูล OCR ได้\n\nกรุณาพิมพ์ 1 (พ.ร.บ.), 2 (ประกันรถยนต์) หรือ 5 (ส่งเอกสาร) เพื่อรับลิงก์ส่วนตัว\n\nไฟล์ที่ส่งใน LINE ครั้งนี้ไม่ได้รับเข้าระบบเอกสาร", env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
@@ -345,7 +345,10 @@ async function processEvent(event, env) {
     return;
   }
 
-  if (await handleIntakeText(event, env, userId, state, originalText)) return;
+  if (["ส่งทะเบียนรถ","ส่งกรมธรรม์","ส่งบัตรหรือใบขับขี่","ไม่มีกรมธรรม์เดิม","ข้อมูลจัดส่ง","แก้ไขข้อมูลจัดส่ง","ยืนยันส่งคำขอ","ส่งเอกสารครบแล้ว","ยินยอมอ่านเอกสาร","consent ocr","ยืนยันข้อมูล"].includes(text) || /^(ชื่อ|name|ที่อยู่|address|มือถือ|อีเมล|แก้ไข|edit)\s*[:：]/i.test(originalText)) {
+    await reply(event.replyToken, "กรุณาดำเนินการส่งเอกสาร ตรวจสอบ OCR และแก้ไขข้อมูลบนเว็บไซต์ HERO Insure เท่านั้น\nพิมพ์ 1, 2 หรือ 5 เพื่อรับลิงก์ส่วนตัว", env.LINE_CHANNEL_ACCESS_TOKEN);
+    return;
+  }
 
   if (text === "1") {
     const caseRecord = await getOrCreateOpenCase(env, userId, "PRB", "LINE_MENU_1");
@@ -414,7 +417,7 @@ async function processEvent(event, env) {
     return;
   }
 
-  if (["ยินยอมอ่านเอกสาร", "consent ocr", "read only latest doc.", "read only latest doc", "read latest document", "อ่านเฉพาะเอกสารล่าสุด"].includes(text)) {
+  if (false && ["ยินยอมอ่านเอกสาร", "consent ocr", "read only latest doc.", "read only latest doc", "read latest document", "อ่านเฉพาะเอกสารล่าสุด"].includes(text)) {
     const record = state?.caseId ? await loadCase(env, state.caseId) : null;
     if (!record) { await reply(event.replyToken, "กรุณาส่งเอกสารก่อน", env.LINE_CHANNEL_ACCESS_TOKEN); return; }
     const latestOnly = !["ยินยอมอ่านเอกสาร", "consent ocr"].includes(text);
@@ -440,12 +443,12 @@ async function processEvent(event, env) {
     return;
   }
 
-  if (["ยืนยันข้อมูล", "confirm details", "confirm"].includes(text) || /^(แก้ไข|edit)(?:\s|$)/i.test(originalText)) {
+  if (false && (["ยืนยันข้อมูล", "confirm details", "confirm"].includes(text) || /^(แก้ไข|edit)(?:\s|$)/i.test(originalText))) {
     await handleCustomerOcrReview(event, env, userId, state, originalText);
     return;
   }
 
-  if (["ส่งเอกสารครบแล้ว", "documents complete", "done"].includes(text)) {
+  if (false && ["ส่งเอกสารครบแล้ว", "documents complete", "done"].includes(text)) {
     if (!state?.caseId) {
       await reply(event.replyToken, "ยังไม่พบเคสเอกสาร กรุณาพิมพ์ 5 เพื่อเริ่มส่งเอกสาร", env.LINE_CHANNEL_ACCESS_TOKEN);
       return;
