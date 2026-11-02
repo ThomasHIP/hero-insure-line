@@ -2,6 +2,11 @@
 
 Status: PROPOSED / NOT DEPLOYED. No production settings or existing insurance flows may be changed without approval.
 
+## Approved product constraints
+- Document upload is WEB-ONLY. LINE OA supplies secure links and notifications; LINE attachments must not be treated as successful uploads.
+- OCR planning budget is USD 0.10–0.15 per sheet (not a verified provider quote). Track per-sheet costs and aggregate per case; avoid re-running OCR for manual text corrections.
+- OCR must be triggered only after successful case-linked web upload, with retry controls to prevent duplicate charges.
+
 ## Customer experience
 - LINE OA is for menu navigation, secure upload links, and notifications only. Do not solicit or accept document attachments as the primary upload path. For incoming image/file messages, send a short reply with the secure web upload link; do not claim the attachment was processed.
 - Start/select a specific insurance case before uploading. Supported case types: PRB, voluntary policy purchase/renewal, claim inquiry, and document correction.
