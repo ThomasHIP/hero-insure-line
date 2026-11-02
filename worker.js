@@ -134,7 +134,8 @@ async function handleCustomer(request, env, url) {
       if (!check || check.size !== bytes.byteLength) throw Error("R2_VERIFICATION_FAILED");
       document.verifiedAt=nowIso();
       await env.DOCUMENTS.put(record.caseId+"/documents/"+encodeURIComponent(document.id)+".json",JSON.stringify(document),{httpMetadata:{contentType:"application/json"}});
-      record.documents=record.documents.filter(d=>d.intakeRole!==role);\n      record.documents.push(document);
+      record.documents=record.documents.filter(d=>d.intakeRole!==role);
+      record.documents.push(document);
       if (role === "POLICY") record.noPreviousPolicy=false;
       record.status="DOCUMENTS_RECEIVING"; record.updatedAt=nowIso();
       record.timeline.push(eventLog("WEB_DOCUMENT_STORED",{documentId:document.id,role}));
