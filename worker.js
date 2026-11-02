@@ -174,7 +174,8 @@ async function handleCustomer(request, env, url) {
         }
         const customer={fields,status:input.confirmed === true?"CUSTOMER_CONFIRMED":"EDITED",updatedAt:nowIso(),...(input.confirmed === true?{confirmedAt:nowIso()}:{})};
         await env.DOCUMENTS.put(document.r2Key+".customer.json",JSON.stringify(customer),{httpMetadata:{contentType:"application/json"}});
-        document.customerReview=customer;\n        record.updatedAt=nowIso(); await saveCase(env,record);
+        document.customerReview=customer;
+        record.updatedAt=nowIso(); await saveCase(env,record);
       }
       return json(customerView(record));
     }
